@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}Review fields — {{ screen.name }}{% endblock %}
+
+{% macro field_row(field) %}
+{% set key = field.block_name ~ "__" ~ field.name %}
+{% set prior = prior_decisions.get((field.block_name, field.name)) %}
+{% set datatype = (field.datatype or '')|upper %}
+{% set is_grid = field.is_grid_column %}
+{% set is_required = field.required %}
+{% set is_readonly = field.readonly %}
+{% set is_lov = field.lov %}
+{% set is_dropdown = (datatype == 'DROPDOWN') %}
+{% set is_checkbox = (datatype == 'CHECKBOX') %}
+{% set is_date = (datatype == 'DATE') %}
+{% set is_number = (datatype == 'NUMBER') %}
+
+<tr class="field-row {% if is_readonly %}row-readonly{% endif %} {% if is_required %}row-required{% endif %}"
+    data-datatype="{{ datatype }}" data-required="{{ '1' if is_required else '0' }}">
+  <td class="mono">{{ field.name }}{% if is_grid %} <span class="pill">grid</span>{% endif %}</td>
+  <td>{{ field.label or '' }}</td>
+  <td class="mono muted">
+    {{ datatype or '?' }}{% if field.length %} ({{ field.length }}){% endif %}
+    {% if is_lov %}<br><span class="pill">LOV {{ field.lov }}</span>{% endif %}
+    {% if is_required %}<br><span class="pill warn">required</span>{% endif %}
+    {% if is_readonly %}<br><span class="pill">readonly</span>{% endif %}
+  </td>
+  <td class="cell-action">
+    {# Action mode select — options depend on datatype #}
+    <select name="mode_{{ key }}" class="mode-select">
+      {% if is_checkbox %}
+        <option value="tick"   {% if prior and prior.mode == 'tick' %}selected{% endif %}>Tick</option>
+        <option value="untick" {% if prior and prior.mode == 'untick' %}selected{% endif %}>Untick</option>
+        <option value="skip"   {% if not is_required and (not prior or prior.mode == 'skip') %}selected{% endif %}>Skip</option>
+      {% elif is_lov %}
+        <option value="lov_match" {% if not prior or prior.mode in ('lov_match','value') %}selected{% endif %}>Select via LOV</option>
+        {% if not is_required %}
+          <option value="skip" {% if prior and prior.mode == 'skip' %}selected{% endif %}>Skip</option>
+        {% endif %}
+      {% elif is_dropdown %}
+        <option value="option" {% if not prior or prior.mode in ('option','value') %}selected{% endif %}>Select option</option>
+        {% if not is_required %}
+          <option value="skip" {% if prior and prior.mode == 'skip' %}selected{% endif %}>Skip</option>
+        {% endif %}
+      {% elif is_date %}
+        <option value="value" {% if prior and prior.mode == 'value' %}selected{% endif %}>Specific date</option>
+        <option value="today" {% if not prior or prior.mode == 'today' %}selected{% endif %}>Today</option>
+        {% if not is_required %}
+          <option value="skip" {% if prior and prior.mode == 'skip' %}selected{% endif %}>Skip</option>
+        {% endif %}
+      {% else %}
+        <option value="value" {% if not prior or prior.mode == 'value' %}selected{% endif %}>Enter value</option>
+        {% if not is_required %}
+          <option value="skip" {% if prior and prior.mode == 'skip' %}selected{% endif %}>Skip</option>
+        {% endif %}
+      {% endif %}
+    </select>
+  </td>
+  <td class="cell-value">
+    {# Value input — type-appropriate #}
+    {% if is_checkbox %}
+      <span class="muted">— no value needed —</span>
+    {% elif is_dropdown and field.options %}
+      <select name="value_{{ key }}">
+        <option value="">— pick option —</option>
+        {% for opt in field.options or [] %}
+          <option value="{{ opt.value }}" {% if prior and prior.value == opt.value %}selected{% endif %}>
+            {{ opt.label }} ({{ opt.value }})
+          </option>
+        {% endfor %}
+      </select>
+    {% elif is_lov %}
+      <input type="text" name="value_{{ key }}"
+             placeholder="row-matching value (e.g. USD)"
+             value="{{ (prior.value if prior else '') or '' }}">
+    {% elif is_date %}
+      <input type="date" name="value_{{ key }}"
+             value="{{ (prior.value if prior else '') or '' }}">
+    {% elif is_number %}
+      <input type="number" name="value_{{ key }}" step="any"
+             value="{{ (prior.value if prior else '') or '' }}">
+    {% else %}
+      <input type="text" name="value_{{ key }}"
+             {% if field.length %}maxlength="{{ field.length }}"{% endif %}
+             value="{{ (prior.value if prior else '') or '' }}">
+    {% endif %}
+  </td>
+</tr>
+{% endmacro %}
+
+{% block content %}
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap;">
+    <div>
+      <h2 style="margin:0 0 6px">Review fields — {{ screen.name }}</h2>
+      <div class="meta-row">
+        <span><span class="k">Function ID</span> <span class="v">{{ screen.function_id }}</span></span>
+        <span><span class="k">Fields</span> <span class="v">{{ screen.fields|length }}</span></span>
+        <span><span class="k">Blocks</span> <span class="v">{{ screen.blocks|length }}</span></span>
+      </div>
+    </div>
+    <div>
+      <a href="{{ url_for('screen_detail', screen_id=screen.id) }}" class="btn ghost">Skip review</a>
+    </div>
+  </div>
+</div>
+
+<form method="post" action="{{ url_for('screen_generate', screen_id=screen.id) }}">
+
+<div class="panel">
+  <h3 style="margin-top:0">Workflow mode</h3>
+  <div class="workflow-modes">
+    {% for mode_key, label in workflow_modes.items() %}
+      {% set disabled = (mode_key != 'create_new') %}
+      <label class="mode-radio {% if disabled %}disabled{% endif %}">
+        <input type="radio" name="workflow_mode" value="{{ mode_key }}"
+               {% if mode_key == active_mode %}checked{% endif %}
+               {% if disabled %}disabled{% endif %}>
+        {{ label }}
+      </label>
+    {% endfor %}
+  </div>
+  <p class="muted" style="margin:10px 0 0 0; font-size:12.5px">
+    v1 supports <strong>Create New</strong>. The other modes are stubbed.
+  </p>
+</div>
+
+{% for block in screen.blocks %}
+  {% set block_fields = screen.fields | selectattr('block_name', 'equalto', block.name) | list %}
+  {% if block_fields %}
+    <div class="panel">
+      <div style="display:flex; justify-content:space-between; align-items:baseline;">
+        <h3 style="margin:0">
+          {{ block.label or block.name }}
+          <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span>
+        </h3>
+        <div>
+          {% if block.is_grid %}<span class="pill">grid · multi-row</span>{% endif %}
+          <span class="muted" style="font-size:12.5px">{{ block_fields|length }} fields</span>
+        </div>
+      </div>
+      {% if block.is_grid %}
+        <p class="muted" style="margin:6px 0 0; font-size:12.5px">
+          Fill values for ONE row. The generated plan will instruct the runner to
+          repeat the Add-Row sequence for each additional input row.
+        </p>
+      {% endif %}
+      <table class="review-table" style="margin-top:14px">
+        <thead>
+          <tr>
+            <th style="width:18%">Name</th>
+            <th style="width:22%">Label</th>
+            <th style="width:14%">Type</th>
+            <th style="width:18%">Action</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for f in block_fields %}
+            {{ field_row(f) }}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+{% endfor %}
+
+<div class="panel" style="position:sticky; bottom:0; z-index:5;">
+  <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+    <button type="submit">Generate CLAUDE.md</button>
+    <a href="{{ url_for('screen_detail', screen_id=screen.id) }}" class="btn ghost">Cancel</a>
+    <span class="muted" style="font-size:12.5px">
+      Required fields cannot be skipped. Read-only fields are auto-populated by FLEXCUBE.
+    </span>
+  </div>
+</div>
+
+</form>
+
+<style>
+  .review-table { width: 100%; border-collapse: collapse; }
+  .review-table th, .review-table td {
+    padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top;
+  }
+  .review-table th {
+    font-size: 11.5px; text-transform: uppercase; color: var(--muted);
+    font-weight: 500; letter-spacing: 0.4px;
+  }
+  .row-readonly td { opacity: 0.55; }
+  .row-required td:first-child::before {
+    content: "*"; color: var(--danger); margin-right: 4px; font-weight: bold;
+  }
+  .cell-action select, .cell-value input, .cell-value select {
+    width: 100%; padding: 7px 9px; background: var(--panel-2);
+    color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    font: inherit; font-size: 13px;
+  }
+  .workflow-modes { display: flex; gap: 14px; flex-wrap: wrap; }
+  .mode-radio {
+    padding: 8px 14px; border: 1px solid var(--border); border-radius: 8px;
+    cursor: pointer; font-size: 13.5px; user-select: none;
+  }
+  .mode-radio.disabled { opacity: 0.45; cursor: not-allowed; }
+  .mode-radio input { margin-right: 6px; vertical-align: middle; }
+</style>
+{% endblock %}

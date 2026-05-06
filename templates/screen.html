@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}{{ screen.name }} — FLEXCUBE Screen Tester{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap;">
+    <div>
+      <h2 style="margin:0 0 6px">{{ screen.name }}</h2>
+      <div class="meta-row">
+        <span><span class="k">Function ID</span> <span class="v">{{ screen.function_id }}</span></span>
+        {% if screen.title %}<span><span class="k">Title</span> <span class="v">{{ screen.title }}</span></span>{% endif %}
+        <span><span class="k">Uploaded</span> <span class="v">{{ screen.created_at }}</span></span>
+      </div>
+      <div class="meta-row" style="margin-top:8px">
+        {% if screen.uixml_filename %}<span class="pill">UIXML: {{ screen.uixml_filename }}</span>{% endif %}
+        {% if screen.js_filename %}<span class="pill">JS: {{ screen.js_filename }}</span>{% endif %}
+        {% if not screen.js_filename %}<span class="pill warn">No JS uploaded — dependencies & validations not extracted</span>{% endif %}
+      </div>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <a class="btn" href="{{ url_for('screen_review', screen_id=screen.id) }}">
+        {% if screen.claude_md %}↻ Review &amp; regenerate{% else %}▶ Review &amp; generate plan{% endif %}
+      </a>
+      {% if screen.claude_md %}
+        <a class="btn ghost" href="{{ url_for('screen_claude_md_download', screen_id=screen.id) }}">⬇ CLAUDE.md</a>
+      {% endif %}
+      <a class="btn ghost" href="{{ url_for('screen_meta_download', screen_id=screen.id) }}">⬇ meta.yaml</a>
+      <form method="post" action="{{ url_for('screen_delete', screen_id=screen.id) }}"
+            onsubmit="return confirm('Delete this screen?');">
+        <button class="danger" type="submit">Delete</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3 style="margin-top:0">Field mapping <span class="muted">({{ screen.fields|length }} fields, {{ screen.blocks|length }} blocks)</span></h3>
+  {% if not screen.fields %}
+    <p class="muted">No fields parsed.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Block</th><th>Name</th><th>Label</th><th>Type</th>
+          <th>Length</th><th>Required</th><th>LOV</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for f in screen.fields %}
+        <tr>
+          <td class="mono muted">{{ f.block_name or '—' }}</td>
+          <td class="mono">{{ f.name }}</td>
+          <td>{{ f.label or '' }}</td>
+          <td class="mono">{{ f.datatype or '' }}</td>
+          <td class="mono">{% if f.length %}{{ f.length }}{% if f.precision is not none %},{{ f.precision }}{% endif %}{% endif %}</td>
+          <td>{% if f.required %}<span class="pill warn">required</span>{% endif %}{% if f.readonly %}<span class="pill">readonly</span>{% endif %}</td>
+          <td class="mono">{{ f.lov or '' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+<div class="grid-2">
+  <div class="panel">
+    <h3 style="margin-top:0">Buttons</h3>
+    {% if not screen.buttons %}
+      <p class="muted">None.</p>
+    {% else %}
+      {% for b in screen.buttons %}
+        <span class="pill">{{ b.label or b.name }}<span class="muted"> · {{ b.name }}</span></span>
+      {% endfor %}
+    {% endif %}
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">Blocks</h3>
+    {% if not screen.blocks %}
+      <p class="muted">None.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>Name</th><th>Label</th><th>Kind</th></tr></thead>
+        <tbody>
+        {% for b in screen.blocks %}
+          <tr>
+            <td class="mono">{{ b.name }}</td>
+            <td>{{ b.label or '' }}</td>
+            <td>
+              {% if b.is_grid %}<span class="pill">grid</span>{% endif %}
+              {% if b.is_tab %}<span class="pill">tab</span>{% endif %}
+              {% if not b.is_grid and not b.is_tab %}<span class="muted">section</span>{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </div>
+</div>
+
+{% if screen.dependencies %}
+<div class="panel">
+  <h3 style="margin-top:0">Cross-field dependencies <span class="muted">(from JS)</span></h3>
+  <table>
+    <thead><tr><th>Source field</th><th>Kind</th><th>Target field</th></tr></thead>
+    <tbody>
+      {% for d in screen.dependencies %}
+        <tr>
+          <td class="mono">{{ d.source_field }}</td>
+          <td><span class="pill">{{ d.kind }}</span></td>
+          <td class="mono">{{ d.target_field }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if screen.validations %}
+<div class="panel">
+  <h3 style="margin-top:0">Inferred validations <span class="muted">(from JS)</span></h3>
+  <table>
+    <thead><tr><th>Field</th><th>Rule</th></tr></thead>
+    <tbody>
+      {% for v in screen.validations %}
+        <tr>
+          <td class="mono">{{ v.field_name }}</td>
+          <td class="mono">{{ v.rule }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if screen.claude_md %}
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:10px;">
+    <h3 style="margin-top:0">Generated CLAUDE.md
+      {% if screen.workflow_mode %}<span class="pill">{{ screen.workflow_mode }}</span>{% endif %}
+    </h3>
+    <div style="display:flex; gap:8px;">
+      <a class="btn ghost" href="{{ url_for('screen_review', screen_id=screen.id) }}">↻ Regenerate</a>
+      <a class="btn"       href="{{ url_for('screen_claude_md_download', screen_id=screen.id) }}">⬇ Download</a>
+    </div>
+  </div>
+  <pre class="code">{{ screen.claude_md }}</pre>
+</div>
+{% else %}
+<div class="panel">
+  <h3 style="margin-top:0">No plan generated yet</h3>
+  <p class="muted" style="margin-top:0">
+    Click <strong>Review &amp; generate plan</strong> above to mark each field's value
+    and produce a CLAUDE.md you can hand to Claude.
+  </p>
+  <a class="btn" href="{{ url_for('screen_review', screen_id=screen.id) }}">▶ Review &amp; generate plan</a>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h3 style="margin-top:0">Generated meta.yaml</h3>
+  <p class="muted" style="margin-top:0">
+    Hand this file to Claude with a prompt like
+    <em>“generate a CLAUDE.md test plan for the screen described in this file.”</em>
+  </p>
+  <pre class="code">{{ screen.meta_yaml }}</pre>
+  <a class="btn" href="{{ url_for('screen_meta_download', screen_id=screen.id) }}">⬇ Download meta.yaml</a>
+</div>
+{% endblock %}

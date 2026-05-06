@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}History — FLEXCUBE Screen Tester{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h2 style="margin-top:0">Saved screens</h2>
+
+  {% if not screens %}
+    <p class="muted">No screens uploaded yet. <a href="{{ url_for('index') }}">Upload one</a>.</p>
+  {% else %}
+    <table>
+      <thead>
+        <tr>
+          <th>Screen name</th>
+          <th>Function ID</th>
+          <th>Blocks</th>
+          <th>Fields</th>
+          <th>Source files</th>
+          <th>Uploaded (UTC)</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in screens %}
+        <tr>
+          <td><a href="{{ url_for('screen_detail', screen_id=s.id) }}">{{ s.name }}</a></td>
+          <td class="mono">{{ s.function_id }}</td>
+          <td>{{ s.block_count }}</td>
+          <td>{{ s.field_count }}</td>
+          <td class="mono muted">
+            {{ s.uixml_filename or '—' }}{% if s.js_filename %}<br>{{ s.js_filename }}{% endif %}
+          </td>
+          <td class="mono muted">{{ s.created_at }}</td>
+          <td class="row-actions">
+            <a class="btn ghost" href="{{ url_for('screen_meta_download', screen_id=s.id) }}">meta.yaml</a>
+            <form method="post" action="{{ url_for('screen_delete', screen_id=s.id) }}"
+                  onsubmit="return confirm('Delete this screen?');">
+              <button class="danger" type="submit">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+{% endblock %}

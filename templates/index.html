@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="panel">
+  <h2 style="margin-top:0">Upload a FLEXCUBE screen</h2>
+  <p class="muted" style="margin-top:0">
+    Provide a screen name plus the screen's UIXML and JS files. The app parses
+    them, stores the field mapping, and produces a single <span class="mono">meta.yaml</span>
+    you can hand directly to Claude.
+  </p>
+
+  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+    <label>
+      <span>Screen name</span>
+      <input type="text" name="screen_name" placeholder="e.g. Fund Online" required autofocus>
+    </label>
+
+    <div class="grid-2">
+      <label>
+        <span>UIXML file <span class="pill">required</span></span>
+        <input type="file" name="uixml" accept=".UIXML,.uixml,.xml,.XML" required>
+      </label>
+      <label>
+        <span>JS file <span class="pill">optional</span></span>
+        <input type="file" name="js" accept=".js,.JS">
+      </label>
+    </div>
+
+    <button type="submit">Parse &amp; generate meta.yaml</button>
+    <a href="{{ url_for('screens_list') }}" class="btn ghost" style="margin-left:8px">View history</a>
+  </form>
+</div>
+
+<div class="panel">
+  <h3 style="margin-top:0">What gets extracted</h3>
+  <ul class="muted" style="margin:0; padding-left:18px; line-height:1.8">
+    <li>From UIXML: every field (name, label, datatype, length, required, LOV), block/grid structure, tabs, buttons.</li>
+    <li>From JS: cross-field dependencies (enables / disables / shows / writes / reads) and inferred validations (regex, length, range).</li>
+    <li>The generated meta.yaml embeds FLEXCUBE conventions (maker-checker, override popup, LOV pattern) so Claude can compose a CLAUDE.md without further prompting.</li>
+  </ul>
+</div>
+{% endblock %}

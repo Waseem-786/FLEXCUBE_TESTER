@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Local config / secrets
+.env
+.env.local
+
+# App-local state — recreated on first run
+screens.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Smoke-test artifacts (Playwright + temp scripts)
+_pw_*.png
+_pw_*.py
+_smoke.py
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude Code — keep shared project config (settings.json) but ignore
+# per-developer overrides and session-accumulated permission caches.
+.claude/settings.local.json
+.claude/cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / dist
+build/
+dist/
