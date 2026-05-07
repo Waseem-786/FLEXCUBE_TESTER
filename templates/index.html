@@ -39,4 +39,36 @@
     <li>The generated meta.yaml embeds FLEXCUBE conventions (maker-checker, override popup, LOV pattern) so Claude can compose a CLAUDE.md without further prompting.</li>
   </ul>
 </div>
+
+{% if recent_screens %}
+<div class="panel">
+  <div style="display:flex; align-items:baseline; justify-content:space-between;">
+    <h3 style="margin-top:0">Recent screens <span class="muted" style="font-size:12.5px">(persisted)</span></h3>
+    <a class="muted" style="font-size:12.5px" href="{{ url_for('screens_list') }}">View all →</a>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Function ID</th><th>Name</th><th>Verified</th><th>Uploaded (UTC)</th><th>Fields</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for s in recent_screens %}
+      <tr>
+        <td class="mono">{{ s.function_id }}</td>
+        <td><a href="{{ url_for('screen_detail', screen_id=s.id) }}">{{ s.name }}</a></td>
+        <td>
+          {% if s.verified_at %}
+            <span class="pill ok">✓ verified</span>
+          {% else %}
+            <span class="pill">unverified</span>
+          {% endif %}
+        </td>
+        <td class="mono muted">{{ s.created_at }}</td>
+        <td class="mono">{{ s.field_count }}</td>
+        <td><a class="btn ghost" href="{{ url_for('screen_detail', screen_id=s.id) }}">Open</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
 {% endblock %}

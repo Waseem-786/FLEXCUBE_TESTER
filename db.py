@@ -97,12 +97,28 @@ CREATE TABLE IF NOT EXISTS validations (
     FOREIGN KEY (screen_id) REFERENCES screens(id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_blocks_screen       ON blocks(screen_id);
-CREATE INDEX IF NOT EXISTS ix_fields_screen       ON fields(screen_id);
-CREATE INDEX IF NOT EXISTS ix_buttons_screen      ON buttons(screen_id);
-CREATE INDEX IF NOT EXISTS ix_dependencies_screen ON dependencies(screen_id);
-CREATE INDEX IF NOT EXISTS ix_validations_screen  ON validations(screen_id);
+CREATE TABLE IF NOT EXISTS runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    screen_id       INTEGER NOT NULL,
+    status          TEXT    NOT NULL,    -- starting | running | completed | failed | stopped
+    started_at      TEXT    NOT NULL,
+    finished_at     TEXT,
+    exit_code       INTEGER,
+    pid             INTEGER,
+    base_url        TEXT,
+    log_path        TEXT,
+    screenshots_dir TEXT,
+    error_message   TEXT,
+    FOREIGN KEY (screen_id) REFERENCES screens(id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_blocks_screen          ON blocks(screen_id);
+CREATE INDEX IF NOT EXISTS ix_fields_screen          ON fields(screen_id);
+CREATE INDEX IF NOT EXISTS ix_buttons_screen         ON buttons(screen_id);
+CREATE INDEX IF NOT EXISTS ix_dependencies_screen    ON dependencies(screen_id);
+CREATE INDEX IF NOT EXISTS ix_validations_screen     ON validations(screen_id);
 CREATE INDEX IF NOT EXISTS ix_field_decisions_screen ON field_decisions(screen_id);
+CREATE INDEX IF NOT EXISTS ix_runs_screen            ON runs(screen_id);
 """
 
 
@@ -110,8 +126,29 @@ CREATE INDEX IF NOT EXISTS ix_field_decisions_screen ON field_decisions(screen_i
 # on every connection so DBs created from older code transparently upgrade.
 # Format: (table, column, ddl-fragment)
 _RUNTIME_COLUMNS = [
-    ("screens", "workflow_mode", "TEXT"),
-    ("screens", "claude_md",     "TEXT"),
+    ("screens", "workflow_mode",      "TEXT"),
+    ("screens", "claude_md",          "TEXT"),
+    # Verification: a screen is "verified" once a successful Claude Code run
+    # has produced a recipe the deterministic runner can use. Three columns:
+    #   verified_at         — UTC ISO timestamp of last verify, or NULL
+    #   verified_by_run_id  — FK to the run that verified it
+    #   recipe_json         — JSON blob (selector overrides, checkbox
+    #                         strategies, LOV iframe titles) extracted from
+    #                         that run's stream-json log
+    ("screens", "verified_at",        "TEXT"),
+    ("screens", "verified_by_run_id", "INTEGER"),
+    ("screens", "recipe_json",        "TEXT"),
+    # Run-level: which runner produced this row. Useful for filtering the
+    # history table and for the verify-modal logic ("only Claude Code runs
+    # are eligible to verify").
+    ("runs",    "kind",               "TEXT"),
+    # Bulk-load workflow: the uploaded Excel data file lives on disk; the
+    # DB just records where + when. `excel_path` is relative to the project
+    # root (so it survives if the project is moved).
+    ("screens", "excel_filename",     "TEXT"),
+    ("screens", "excel_path",         "TEXT"),
+    ("screens", "excel_uploaded_at",  "TEXT"),
+    ("screens", "excel_row_count",    "INTEGER"),
 ]
 
 
@@ -227,8 +264,12 @@ def list_screens(db_path: str | Path) -> list[dict[str, Any]]:
     with _connect(db_path) as conn:
         rows = conn.execute(
             """SELECT s.id, s.name, s.function_id, s.created_at, s.uixml_filename, s.js_filename,
-                      (SELECT COUNT(*) FROM fields  f WHERE f.screen_id = s.id) AS field_count,
-                      (SELECT COUNT(*) FROM blocks  b WHERE b.screen_id = s.id) AS block_count
+                      s.verified_at, s.verified_by_run_id, s.workflow_mode,
+                      (SELECT COUNT(*) FROM fields f WHERE f.screen_id = s.id) AS field_count,
+                      (SELECT COUNT(*) FROM blocks b WHERE b.screen_id = s.id) AS block_count,
+                      (SELECT COUNT(*) FROM runs   r WHERE r.screen_id = s.id) AS run_count,
+                      (SELECT COUNT(*) FROM runs   r WHERE r.screen_id = s.id
+                                                      AND r.status = 'completed') AS run_success_count
                FROM screens s
                ORDER BY s.created_at DESC, s.id DESC"""
         ).fetchall()
@@ -282,9 +323,59 @@ def get_meta_yaml(db_path: str | Path, screen_id: int) -> str | None:
 def delete_screen(db_path: str | Path, screen_id: int) -> None:
     with _connect(db_path) as conn:
         for table in ("blocks", "fields", "buttons", "dependencies", "validations",
-                      "field_decisions"):
+                      "field_decisions", "runs"):
             conn.execute(f"DELETE FROM {table} WHERE screen_id = ?", (screen_id,))
         conn.execute("DELETE FROM screens WHERE id = ?", (screen_id,))
+
+
+# ---------------------------------------------------------------------------
+# Runs (plan-execution sessions)
+# ---------------------------------------------------------------------------
+
+def create_run(
+    db_path: str | Path,
+    screen_id: int,
+    base_url: str | None,
+    log_path: str,
+    screenshots_dir: str,
+) -> int:
+    with _connect(db_path) as conn:
+        cur = conn.execute(
+            """INSERT INTO runs (screen_id, status, started_at, base_url, log_path, screenshots_dir)
+               VALUES (?, 'starting', ?, ?, ?, ?)""",
+            (
+                screen_id,
+                datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                base_url,
+                log_path,
+                screenshots_dir,
+            ),
+        )
+        return cur.lastrowid
+
+
+def update_run(db_path: str | Path, run_id: int, **fields) -> None:
+    if not fields:
+        return
+    cols = ", ".join(f"{k} = ?" for k in fields)
+    with _connect(db_path) as conn:
+        conn.execute(f"UPDATE runs SET {cols} WHERE id = ?",
+                     (*fields.values(), run_id))
+
+
+def get_run(db_path: str | Path, run_id: int) -> dict | None:
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def list_runs(db_path: str | Path, screen_id: int) -> list[dict]:
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM runs WHERE screen_id = ? ORDER BY id DESC LIMIT 50",
+            (screen_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -330,3 +421,127 @@ def get_claude_md(db_path: str | Path, screen_id: int) -> str | None:
             "SELECT claude_md FROM screens WHERE id = ?", (screen_id,)
         ).fetchone()
         return row["claude_md"] if row and row["claude_md"] else None
+
+
+# ---------------------------------------------------------------------------
+# Verification — pinning a screen to a successful Claude Code run + its recipe
+# ---------------------------------------------------------------------------
+
+def mark_verified(
+    db_path: str | Path,
+    screen_id: int,
+    run_id: int,
+    recipe: dict | None,
+) -> None:
+    import json as _json
+    payload = _json.dumps(recipe, default=str) if recipe is not None else None
+    with _connect(db_path) as conn:
+        conn.execute(
+            """UPDATE screens
+                  SET verified_at        = ?,
+                      verified_by_run_id = ?,
+                      recipe_json        = ?
+                WHERE id = ?""",
+            (datetime.utcnow().isoformat(timespec="seconds") + "Z",
+             run_id, payload, screen_id),
+        )
+
+
+def unmark_verified(db_path: str | Path, screen_id: int) -> None:
+    with _connect(db_path) as conn:
+        conn.execute(
+            """UPDATE screens
+                  SET verified_at = NULL,
+                      verified_by_run_id = NULL,
+                      recipe_json = NULL
+                WHERE id = ?""",
+            (screen_id,),
+        )
+
+
+def get_recipe(db_path: str | Path, screen_id: int) -> dict | None:
+    """Return the parsed recipe dict for a verified screen, or None.
+    Used by the deterministic runner to apply per-screen selector overrides."""
+    import json as _json
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT recipe_json FROM screens WHERE id = ?", (screen_id,)
+        ).fetchone()
+        if not row or not row["recipe_json"]:
+            return None
+        try:
+            return _json.loads(row["recipe_json"])
+        except _json.JSONDecodeError:
+            return None
+
+
+def set_run_kind(db_path: str | Path, run_id: int, kind: str) -> None:
+    with _connect(db_path) as conn:
+        conn.execute("UPDATE runs SET kind = ? WHERE id = ?", (kind, run_id))
+
+
+# ---------------------------------------------------------------------------
+# Bulk-load Excel state
+# ---------------------------------------------------------------------------
+
+def save_excel_upload(
+    db_path: str | Path,
+    screen_id: int,
+    *,
+    filename: str,
+    path: str,
+    row_count: int,
+) -> None:
+    """Pin an uploaded XLSX file to a screen. Re-uploading replaces the
+    previous values (path is recorded but the old file isn't deleted —
+    that's a manual cleanup if needed).
+
+    Also pins `workflow_mode = 'bulk_load'` because an Excel upload is a
+    strong signal the user wants bulk mode. Without this, the workflow
+    radio resets to its default ('create_new') when the page reloads
+    after the upload — so a subsequent Generate click submits with the
+    wrong mode and produces a create_new plan against the stub fields.
+    """
+    with _connect(db_path) as conn:
+        conn.execute(
+            """UPDATE screens
+                  SET excel_filename    = ?,
+                      excel_path        = ?,
+                      excel_uploaded_at = ?,
+                      excel_row_count   = ?,
+                      workflow_mode     = 'bulk_load'
+                WHERE id = ?""",
+            (filename, path,
+             datetime.utcnow().isoformat(timespec="seconds") + "Z",
+             row_count, screen_id),
+        )
+
+
+def clear_excel_upload(db_path: str | Path, screen_id: int) -> None:
+    with _connect(db_path) as conn:
+        conn.execute(
+            """UPDATE screens
+                  SET excel_filename = NULL,
+                      excel_path = NULL,
+                      excel_uploaded_at = NULL,
+                      excel_row_count = NULL
+                WHERE id = ?""",
+            (screen_id,),
+        )
+
+
+def get_eligible_verify_run(db_path: str | Path, screen_id: int) -> dict | None:
+    """Most-recent successful Claude Code run for a screen, if any. Used by
+    the run-detail page to decide whether to show the 'Verify & save' prompt.
+    A run is eligible if status='completed' AND kind='claude_code' AND it
+    isn't already the verifying run."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """SELECT * FROM runs
+                WHERE screen_id = ?
+                  AND status = 'completed'
+                  AND COALESCE(kind, 'claude_code') = 'claude_code'
+                ORDER BY id DESC LIMIT 1""",
+            (screen_id,),
+        ).fetchone()
+        return dict(row) if row else None

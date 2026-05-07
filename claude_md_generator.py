@@ -37,11 +37,10 @@ from typing import Iterable
 
 WORKFLOW_MODES = {
     "create_new":     "Create New",
-    # Stubbed for v1 — surfaced in the UI as disabled options so we know
-    # they're on the roadmap but not yet supported.
+    "bulk_load":      "Bulk Load from Excel",
+    # Still stubbed.
     "copy_existing":  "Copy Existing  (coming soon)",
     "modify":         "Modify Existing  (coming soon)",
-    "bulk_load":      "Bulk Load from Excel  (coming soon)",
 }
 
 
@@ -49,11 +48,15 @@ def generate_claude_md(
     screen: dict,
     workflow_mode: str,
     decisions: list[dict],
+    *,
+    excel_rows: list[dict] | None = None,
 ) -> str:
+    if workflow_mode == "bulk_load":
+        return _generate_bulk_load(screen, decisions, excel_rows or [])
     if workflow_mode != "create_new":
         raise ValueError(
-            f"workflow_mode={workflow_mode!r} is not implemented in v1; "
-            f"use 'create_new'."
+            f"workflow_mode={workflow_mode!r} is not implemented; "
+            f"supported modes are 'create_new' and 'bulk_load'."
         )
 
     fid = screen["function_id"]
@@ -310,20 +313,20 @@ def _field_action_lines(field: dict, decision: dict | None) -> list[str]:
     (skipped, or no decision given for an optional field)."""
     if decision is None or decision["mode"] == "skip":
         # Required fields with no decision get a TODO so the user notices.
-        if field["required"]:
+        if field.get("required"):
             return [
-                f"- <!-- TODO: required field **{field['label'] or field['name']}** "
+                f"- <!-- TODO: required field **{field.get('label') or field['name']}** "
                 f"({field['name']}) has no value. Update the Review page. -->"
             ]
         return []
 
-    label = field["label"] or field["name"]
+    label = field.get("label") or field["name"]
     name = field["name"]
-    dtype = (field["datatype"] or "").upper()
+    dtype = (field.get("datatype") or "").upper()
     mode = decision["mode"]
     value = decision.get("value") or ""
 
-    if mode == "lov_match" or (mode == "value" and field["lov"]):
+    if mode == "lov_match" or (mode == "value" and field.get("lov")):
         return [
             f"- Click the **LOV button** next to the **{label}** ({name}) field.",
             "- In the LOV popup, click **Fetch**.",
@@ -373,6 +376,247 @@ def _pick_primary_key(
 # Form-decision parsing helper used by the Flask route
 # ---------------------------------------------------------------------------
 
+BULK_LOAD_ROW_CAP = 50  # safety cap; can be raised once we've battle-tested
+                        # longer plans against real FLEXCUBE deployments.
+
+
+def _generate_bulk_load(
+    screen: dict,
+    decisions: list[dict],
+    excel_rows: list[dict],
+) -> str:
+    """Compose a CLAUDE.md that creates ONE record per row in the uploaded
+    Excel file. Each row's body reuses the create_new rendering — login,
+    Save, validation, and authorize steps appear ONCE at the top/bottom and
+    the per-record block (New → fill → Save) is repeated for every row.
+
+    Decisions schema for bulk_load:
+      mode='excel'  → value is the Excel column name (= field NAME). The
+                      composer looks up `excel_row[value]` for each row.
+      mode='value'/'today'/etc. → constant across all rows (same as
+                      create_new).
+      mode='skip'   → field omitted.
+
+    Grids are deliberately not bulk-handled in this iteration; we emit a
+    TODO marker per grid block so the user can fill those manually if they
+    care.
+    """
+    fid = screen["function_id"]
+    name = screen["name"]
+    blocks = screen["blocks"]
+    fields = screen["fields"]
+
+    if not excel_rows:
+        # Plan still composes — handy for previewing structure — but the
+        # body is just a TODO so the user notices they haven't uploaded.
+        return _bulk_empty_plan(fid, name, decisions)
+
+    rows = excel_rows[:BULK_LOAD_ROW_CAP]
+    capped = len(excel_rows) > BULK_LOAD_ROW_CAP
+
+    out: list[str] = []
+    out.append(f"# {name} Bulk Load Automation Prompt")
+    out.append("")
+    out.append("## Objective")
+    out.append(
+        f"Create {len(rows)} new record(s) on the **{fid}** ({name}) screen "
+        f"by iterating an Excel data file. For each row, run a New / fill / "
+        f"Save sequence; complete maker-checker authorization at the end."
+    )
+    out.append("")
+    out.append("---")
+    out.append("")
+    out.extend(_config_section(fid))
+    out.append("")
+    out.append("---")
+    out.append("")
+    out.append("## Automation Workflow")
+    out.append("")
+
+    step = _StepCounter()
+
+    out.append(step.heading("Login"))
+    out.extend([
+        "- Open browser",
+        "- Navigate to base_url",
+        "- Enter username and password",
+        "- Click **Sign In**",
+        "",
+    ])
+    out.append(step.heading("Post-login Handling"))
+    out.extend(["- If informational popup appears, click **OK**", ""])
+    out.append(step.heading(f"Navigate to Screen {fid}"))
+    out.extend([
+        "- Locate screen ID input (top-right corner)",
+        f"- Enter screen_id from config (`{fid}`)",
+        f"- Submit to open the {name} screen",
+        "",
+    ])
+
+    # Per-row body: repeat New → fill → Save for each row.
+    for i, excel_row in enumerate(rows, start=1):
+        title = f"Process row {i} of {len(rows)}"
+        # Try to surface a useful identifier in the heading.
+        ident_field = _row_identifier(fields, excel_row)
+        if ident_field:
+            ident_val = excel_row.get(ident_field["name"])
+            title += f"  ({ident_field['label'] or ident_field['name']} = {ident_val})"
+
+        out.append(step.heading(title))
+        out.append("- Click **New** button.")
+
+        row_decisions = _materialise_for_row(decisions, excel_row, fields)
+        decisions_by_key = {(d.get("block_name"), d["field_name"]): d for d in row_decisions}
+
+        for block in blocks:
+            block_fields = [f for f in fields if f["block_name"] == block["name"]]
+            if not block_fields:
+                continue
+            if block["is_grid"]:
+                out.append(
+                    f"- <!-- TODO: grid block **{block['label'] or block['name']}** "
+                    f"is not handled by bulk-load v1. Fill manually if needed. -->"
+                )
+                continue
+
+            for f in block_fields:
+                action_lines = _field_action_lines(f, decisions_by_key.get((block["name"], f["name"])))
+                out.extend(action_lines)
+
+        out.append("- Click **Save**.")
+        out.append("- If any **Override** popup appears, click **Accept**.")
+        out.append("- Confirm success message or UI confirmation.")
+        out.append("")
+
+    if capped:
+        out.append(
+            f"<!-- TODO: Excel had more rows than the v1 cap "
+            f"({BULK_LOAD_ROW_CAP}). Process the remaining "
+            f"{len(excel_rows) - BULK_LOAD_ROW_CAP} rows in a follow-up run. -->"
+        )
+        out.append("")
+
+    auth_step_n = step.peek_next()
+    out.append(step.heading("Check Authorization Status"))
+    out.extend([
+        "- After saving each record, check the **Authorization Status** field.",
+        f"- If status is **Unauthorized** (`U`), proceed to step {auth_step_n + 1}.",
+        "- If status is **Authorized** (`A`), skip authorization for that record.",
+        "",
+    ])
+
+    pk_field = _pick_primary_key(blocks, fields, {})
+    out.append(step.heading("Authorize each unauthorised record (second user)"))
+    out.extend([
+        "- Open a second browser session and log in as the checker user "
+        "(`accorder_auth_username` / `accorder_auth_password`)",
+        f"- Navigate to screen **{fid}**",
+        "- For each record that is still Unauthorized:",
+        "  - Click **Enter Query**",
+        f"  - Enter the **{pk_field['label'] or pk_field['name']}** value in the corresponding field"
+        if pk_field
+        else "  - Enter the unique identifier of the record into the corresponding field",
+        "  - Click **Execute Query** to load the record",
+        "  - Click **Authorize**",
+        "  - If any **Accept** popup appears, click **Accept**",
+        "  - Confirm authorization success message",
+        "",
+    ])
+
+    out.append("---")
+    out.append("")
+    out.extend([
+        "## Technical Requirements",
+        "- Use Playwright or Selenium",
+        "- Avoid hardcoded values",
+        "- Use explicit waits (no sleep)",
+        "- Include error handling",
+        "- Add logging",
+        "- Write modular, clean code",
+        "",
+    ])
+
+    return "\n".join(out)
+
+
+_CHECKBOX_TRUTHY = {"YES", "Y", "TRUE", "1", "TICK", "TICKED", "CHECKED"}
+
+
+def _materialise_for_row(
+    decisions: list[dict],
+    excel_row: dict,
+    fields: list[dict],
+) -> list[dict]:
+    """Substitute Excel cell values into 'excel'-mode decisions, mapping the
+    cell to the correct decision mode based on the field's datatype:
+
+      LOV-bound       → mode='lov_match'   (cell value = the row to match)
+      CHECKBOX        → mode='tick' if cell is Yes/Y/TRUE/1/etc, else 'skip'
+      DROPDOWN/RADIO  → mode='option'
+      DATE            → mode='value'  (already YYYY-MM-DD via _coerce)
+      NUMBER / TEXT   → mode='value'
+
+    Empty cells become 'skip' regardless of field type so an unfilled cell
+    doesn't fabricate an "Enter `` into …" line.
+    """
+    field_lookup = {(f["block_name"], f["name"]): f for f in fields}
+    out: list[dict] = []
+    for d in decisions:
+        if d["mode"] != "excel":
+            out.append(d)
+            continue
+
+        field = field_lookup.get((d.get("block_name"), d["field_name"])) or {}
+        cell = excel_row.get(d.get("value") or d["field_name"])
+        out.append(_excel_cell_to_decision(d, cell, field))
+    return out
+
+
+def _excel_cell_to_decision(d: dict, cell, field: dict) -> dict:
+    if cell in (None, ""):
+        return {**d, "mode": "skip", "value": None}
+
+    cell_str = str(cell).strip()
+    datatype = (field.get("datatype") or "").upper()
+
+    if field.get("lov"):
+        return {**d, "mode": "lov_match", "value": cell_str}
+    if datatype == "CHECKBOX":
+        if cell_str.upper() in _CHECKBOX_TRUTHY:
+            return {**d, "mode": "tick", "value": None}
+        # "No" / "False" / blank-after-strip → skip rather than untick: an
+        # untick is a click, which would TOGGLE a checkbox that was already
+        # unchecked. Only emit clicks when the user explicitly says Yes.
+        return {**d, "mode": "skip", "value": None}
+    if datatype in ("DROPDOWN", "RADIO"):
+        return {**d, "mode": "option", "value": cell_str}
+    return {**d, "mode": "value", "value": cell_str}
+
+
+def _row_identifier(fields: list[dict], row: dict) -> dict | None:
+    """Pick a sensible field whose value to surface in row headings."""
+    for f in fields:
+        if f.get("required") and f["name"] in row and row[f["name"]] not in (None, ""):
+            return f
+    return None
+
+
+def _bulk_empty_plan(fid: str, name: str, decisions: list[dict]) -> str:
+    excel_count = sum(1 for d in decisions if d["mode"] == "excel")
+    return "\n".join([
+        f"# {name} Bulk Load Automation Prompt",
+        "",
+        "## Objective",
+        f"Create N records on the **{fid}** ({name}) screen by iterating "
+        f"an Excel data file.",
+        "",
+        f"<!-- TODO: no Excel file uploaded yet. Upload one with {excel_count} "
+        f"column(s) corresponding to the fields marked 'from Excel' on the "
+        f"Review page, then click Generate again. -->",
+        "",
+    ])
+
+
 def parse_decisions_from_form(fields: list[dict], form) -> list[dict]:
     """Translate the multipart form posted by review.html into the decision
     list the generator consumes. The form encoding is per-field with these
@@ -387,6 +631,13 @@ def parse_decisions_from_form(fields: list[dict], form) -> list[dict]:
         key = f"{f['block_name']}__{f['name']}"
         mode = (form.get(f"mode_{key}") or "skip").strip()
         value = (form.get(f"value_{key}") or "").strip() or None
+
+        # 'excel' mode means "this field's value is sourced from the Excel
+        # column whose header equals this field's NAME." We don't need a
+        # `value` for that — store the field name in `value` so the bulk
+        # composer's lookup is uniform with other modes.
+        if mode == "excel":
+            value = f["name"]
 
         # If the user picked a value-bearing mode but didn't supply one,
         # fall back to skip rather than emitting an empty quoted string.

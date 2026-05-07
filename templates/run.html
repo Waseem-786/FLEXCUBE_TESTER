@@ -1,0 +1,278 @@
+{% extends "base.html" %}
+{% block title %}Run #{{ run.id }} — {{ screen.name }}{% endblock %}
+
+{% block content %}
+
+{% if can_verify %}
+<div class="panel" style="border-color: var(--success); background: rgba(74,222,128,0.05);">
+  <div style="display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap;">
+    <div>
+      <h3 style="margin:0 0 6px; color: var(--success)">✓ Run completed successfully</h3>
+      <p class="muted" style="margin:0; font-size:13px">
+        Save this run as the verified plan for <strong>{{ screen.function_id }}</strong>?
+        We'll extract the agent's adaptations (checkbox click strategies, LOV iframe titles,
+        anything unusual) into a recipe the deterministic runner uses for future runs.
+      </p>
+    </div>
+    <form method="post" action="{{ url_for('screen_verify', screen_id=screen.id) }}"
+          style="display:flex; gap:8px;">
+      <input type="hidden" name="run_id" value="{{ run.id }}">
+      <button type="submit">✓ Verify &amp; save recipe</button>
+      <a class="btn ghost" href="{{ url_for('screen_detail', screen_id=screen.id) }}">Skip</a>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap;">
+    <div>
+      <h2 style="margin:0 0 6px">
+        Run #{{ run.id }} <span class="muted" style="font-size:14px">— {{ screen.name }}</span>
+      </h2>
+      <div class="meta-row">
+        <span><span class="k">Status</span>
+          <span id="run-status" class="pill {% if run.status == 'running' %}ok{% elif run.status == 'failed' %}warn{% endif %}">
+            {{ run.status }}
+          </span>
+        </span>
+        <span><span class="k">Started</span> <span class="v mono">{{ run.started_at }}</span></span>
+        {% if run.finished_at %}
+          <span><span class="k">Finished</span> <span class="v mono">{{ run.finished_at }}</span></span>
+        {% endif %}
+        {% if run.exit_code is not none %}
+          <span><span class="k">Exit</span> <span class="v mono">{{ run.exit_code }}</span></span>
+        {% endif %}
+        <span><span class="k">Target</span> <span class="v mono">{{ run.base_url or '—' }}</span></span>
+      </div>
+      {% if run.error_message %}
+        <div class="flash error" style="margin-top:12px">{{ run.error_message }}</div>
+      {% endif %}
+    </div>
+    <div style="display:flex; gap:8px;">
+      {% if run.status in ('starting', 'running') %}
+        <form method="post" action="{{ url_for('run_stop', screen_id=screen.id, run_id=run.id) }}"
+              onsubmit="return confirm('Stop this run? The browser will close immediately.');">
+          <button class="danger" type="submit">⏹ Stop</button>
+        </form>
+      {% endif %}
+      <a class="btn ghost" href="{{ url_for('screen_detail', screen_id=screen.id) }}">Back to screen</a>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <div style="display:flex; align-items:baseline; justify-content:space-between;">
+    <h3 style="margin-top:0">Live event stream</h3>
+    <span class="muted" style="font-size:12.5px" id="stream-state">connecting…</span>
+  </div>
+  <div id="event-log" class="event-log">
+    <div class="muted" style="padding:14px 16px">Waiting for events…</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h3 style="margin-top:0">Screenshots <span class="muted" id="shot-count" style="font-size:12.5px"></span></h3>
+  <div id="screenshots" class="shots-grid">
+    <div class="muted">No screenshots yet.</div>
+  </div>
+</div>
+
+<style>
+  .event-log {
+    background: #0a0c11; border: 1px solid var(--border); border-radius: 8px;
+    max-height: 480px; overflow-y: auto; font-family: var(--mono); font-size: 12.5px;
+  }
+  .event-log .ev {
+    padding: 6px 14px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 12px; align-items: baseline;
+  }
+  .event-log .ev:last-child { border-bottom: none; }
+  .event-log .ev .ts { color: var(--muted); white-space: nowrap; font-size: 11.5px; min-width: 70px; }
+  .event-log .ev .kind {
+    display: inline-block; min-width: 78px;
+    padding: 0 6px; border-radius: 4px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px;
+  }
+  .event-log .ev .kind.assistant   { background: rgba(91,141,239,.15);  color: var(--accent); }
+  .event-log .ev .kind.tool_use    { background: rgba(74,222,128,.15);  color: var(--success); }
+  .event-log .ev .kind.tool_result { background: rgba(74,222,128,.10);  color: var(--success); opacity: 0.9; }
+  .event-log .ev .kind.system      { background: rgba(140,147,163,.15); color: var(--muted); }
+  .event-log .ev .kind.result      { background: rgba(91,141,239,.20);  color: var(--accent); }
+  .event-log .ev .kind.error       { background: rgba(248,113,113,.15); color: var(--danger); }
+  .event-log .ev .kind.step        { background: rgba(91,141,239,.30);  color: var(--accent); font-weight: bold; }
+  .event-log .ev .body { color: var(--text); white-space: pre-wrap; word-break: break-word; flex: 1; }
+
+  .shots-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+  }
+  .shots-grid figure {
+    margin: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+    background: var(--panel-2);
+  }
+  .shots-grid img { display: block; width: 100%; height: auto; }
+  .shots-grid figcaption { padding: 6px 10px; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+</style>
+
+<script>
+(() => {
+  const RUN_ID  = {{ run.id }};
+  const STREAM  = "{{ url_for('run_stream', screen_id=screen.id, run_id=run.id) }}";
+  const SHOTS   = "{{ url_for('run_screenshots_list', screen_id=screen.id, run_id=run.id) }}";
+  const SHOT_BASE = "{{ url_for('run_screenshot', screen_id=screen.id, run_id=run.id, filename='__name__') }}".replace('__name__', '');
+  const INITIAL_STATUS = "{{ run.status }}";
+  const log = document.getElementById('event-log');
+  const stateLine = document.getElementById('stream-state');
+  const statusPill = document.getElementById('run-status');
+  let firstEvent = true;
+
+  function ts() {
+    return new Date().toLocaleTimeString([], { hour12: false });
+  }
+
+  function row(kind, body) {
+    if (firstEvent) { log.innerHTML = ''; firstEvent = false; }
+    const div = document.createElement('div');
+    div.className = 'ev';
+    div.innerHTML =
+      '<span class="ts"></span>' +
+      '<span class="kind"></span>' +
+      '<span class="body"></span>';
+    div.children[0].textContent = ts();
+    div.children[1].textContent = kind;
+    div.children[1].classList.add(kind.replace(/\W/g, '_').toLowerCase());
+    div.children[2].textContent = body;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  // Render one Claude Code stream-json event as a row.
+  function renderEvent(obj) {
+    const t = obj.type;
+    if (t === 'system') {
+      if (obj.subtype === 'init') {
+        row('system', `session ${obj.session_id || ''} — model ${obj.model || ''}`);
+      } else {
+        row('system', JSON.stringify(obj));
+      }
+      return;
+    }
+    if (t === 'assistant') {
+      const blocks = (obj.message && obj.message.content) || [];
+      for (const b of blocks) {
+        if (b.type === 'text') {
+          // Detect "STEP N: title" lines and tag them prominently
+          const m = (b.text || '').match(/^\s*STEP\s+(\d+):\s*(.+)$/m);
+          if (m) {
+            row('step', `Step ${m[1]}: ${m[2]}`);
+          } else if ((b.text || '').trim()) {
+            row('assistant', b.text.trim());
+          }
+        } else if (b.type === 'tool_use') {
+          const args = b.input ? JSON.stringify(b.input) : '';
+          row('tool_use', `${b.name}  ${args.length > 240 ? args.slice(0, 240) + '…' : args}`);
+        }
+      }
+      return;
+    }
+    if (t === 'user') {
+      // Tool results come back as user messages (per Anthropic's tool-use schema).
+      const blocks = (obj.message && obj.message.content) || [];
+      for (const b of blocks) {
+        if (b.type === 'tool_result') {
+          const text = typeof b.content === 'string'
+              ? b.content
+              : (Array.isArray(b.content) ? b.content.map(x => x.text || '').join(' ').trim() : '');
+          const trimmed = text.length > 240 ? text.slice(0, 240) + '…' : text;
+          row(b.is_error ? 'error' : 'tool_result', trimmed || '(ok)');
+        }
+      }
+      return;
+    }
+    if (t === 'result') {
+      row('result', `${obj.subtype || ''} — ${obj.duration_ms || '?'}ms`);
+      return;
+    }
+    row('system', JSON.stringify(obj));
+  }
+
+  // ---- SSE -----------------------------------------------------------
+  if (INITIAL_STATUS === 'starting' || INITIAL_STATUS === 'running') {
+    const es = new EventSource(STREAM);
+    stateLine.textContent = 'streaming…';
+
+    es.onmessage = (msg) => {
+      try {
+        const obj = JSON.parse(msg.data);
+        renderEvent(obj);
+      } catch (e) {
+        row('system', msg.data);
+      }
+    };
+    es.addEventListener('done', (msg) => {
+      try {
+        const final = JSON.parse(msg.data);
+        statusPill.textContent = final.status;
+        statusPill.classList.remove('ok', 'warn');
+        if (final.status === 'completed') statusPill.classList.add('ok');
+        else statusPill.classList.add('warn');
+        row('system', `Done — ${final.status}` + (final.exit_code != null ? ` (exit ${final.exit_code})` : ''));
+        if (final.error_message) row('error', final.error_message);
+      } catch (e) {}
+      stateLine.textContent = 'closed';
+      es.close();
+      // Reload once to surface persisted Stop button removal / final timestamps.
+      setTimeout(() => location.reload(), 1500);
+    });
+    es.onerror = () => {
+      stateLine.textContent = 'connection lost';
+    };
+  } else {
+    stateLine.textContent = 'finished';
+    // Replay log file content (if any) into the panel by hitting stream once;
+    // it will yield buffered lines and then close.
+    fetch(STREAM).then(r => r.text()).then(text => {
+      // Rough parse of SSE buffered output.
+      for (const block of text.split('\n\n')) {
+        const m = block.match(/^data: (.*)$/m);
+        if (!m) continue;
+        try { renderEvent(JSON.parse(m[1])); } catch (e) { row('system', m[1]); }
+      }
+    }).catch(() => {});
+  }
+
+  // ---- Screenshots gallery (poll) -----------------------------------
+  const gallery = document.getElementById('screenshots');
+  const shotCount = document.getElementById('shot-count');
+  let known = new Set();
+  async function refreshShots() {
+    try {
+      const r = await fetch(SHOTS);
+      const data = await r.json();
+      const names = data.screenshots || [];
+      if (names.length === 0) return;
+      if (known.size === 0) gallery.innerHTML = '';
+      for (const name of names) {
+        if (known.has(name)) continue;
+        known.add(name);
+        const fig = document.createElement('figure');
+        fig.innerHTML =
+          '<a target="_blank"><img loading="lazy"></a>' +
+          '<figcaption></figcaption>';
+        const url = SHOT_BASE + encodeURIComponent(name);
+        fig.querySelector('a').href = url;
+        fig.querySelector('img').src = url;
+        fig.querySelector('figcaption').textContent = name;
+        gallery.appendChild(fig);
+      }
+      shotCount.textContent = `(${known.size})`;
+    } catch (e) { /* keep polling */ }
+  }
+  refreshShots();
+  if (INITIAL_STATUS === 'starting' || INITIAL_STATUS === 'running') {
+    setInterval(refreshShots, 3000);
+  }
+})();
+</script>
+{% endblock %}

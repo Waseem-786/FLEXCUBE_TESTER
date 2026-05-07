@@ -147,6 +147,138 @@
   </div>
   <pre class="code">{{ screen.claude_md }}</pre>
 </div>
+
+<div class="panel">
+  <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:10px;">
+    <div>
+      <h3 style="margin-top:0; margin-bottom:6px">Run plan against FLEXCUBE</h3>
+      {% if is_verified %}
+        <span class="pill ok">✓ verified</span>
+        <span class="muted" style="font-size:12.5px">
+          last verified {{ screen.verified_at }} · run #{{ screen.verified_by_run_id }}
+        </span>
+        <form method="post" action="{{ url_for('screen_unverify', screen_id=screen.id) }}"
+              onsubmit="return confirm('Mark unverified? Future runs will require Claude Code first.');"
+              style="display:inline; margin-left:6px">
+          <button type="submit" class="ghost" style="padding:2px 8px; font-size:11.5px;">Mark unverified</button>
+        </form>
+      {% else %}
+        <span class="pill">unverified</span>
+        <span class="muted" style="font-size:12.5px">
+          run with Claude Code first; verifying after a successful run unlocks the fast deterministic path
+        </span>
+      {% endif %}
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      {% if is_verified %}
+        {# Verified: deterministic primary, Claude Code is the "re-verify" fallback #}
+        <form id="run-form-deterministic" method="post"
+              action="{{ url_for('run_start_deterministic', screen_id=screen.id) }}"
+              onsubmit="return confirmRun('deterministic');">
+          <button type="submit"
+                  {% if not runner_cfg_ok %}disabled{% endif %}
+                  title="{% if not runner_cfg_ok %}Missing env: {{ runner_cfg_missing | join(', ') }}{% endif %}">
+            ▶ Run plan (deterministic) — fast
+          </button>
+        </form>
+        <form id="run-form-claude" method="post"
+              action="{{ url_for('run_start', screen_id=screen.id) }}"
+              onsubmit="return confirmRun('Claude Code (re-verify)');">
+          <button type="submit" class="ghost"
+                  {% if not (runner_cli_ok and runner_cfg_ok) %}disabled{% endif %}
+                  title="{% if not runner_cli_ok %}Claude Code CLI not on PATH{% elif not runner_cfg_ok %}Missing env: {{ runner_cfg_missing | join(', ') }}{% endif %}">
+            ↻ Re-verify with Claude Code
+          </button>
+        </form>
+      {% else %}
+        {# Unverified: Claude Code primary, deterministic locked until verification #}
+        <form id="run-form-claude" method="post"
+              action="{{ url_for('run_start', screen_id=screen.id) }}"
+              onsubmit="return confirmRun('Claude Code');">
+          <button type="submit"
+                  {% if not (runner_cli_ok and runner_cfg_ok) %}disabled{% endif %}
+                  title="{% if not runner_cli_ok %}Claude Code CLI not on PATH{% elif not runner_cfg_ok %}Missing env: {{ runner_cfg_missing | join(', ') }}{% endif %}">
+            ▶ Run plan (Claude Code)
+          </button>
+        </form>
+        <button type="button" class="ghost" disabled
+                title="Run successfully with Claude Code first, then verify on the run page to unlock this.">
+          ▶ Run plan (deterministic) 🔒
+        </button>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="muted" style="margin:8px 0 10px; font-size:13px">
+    {% if is_verified %}
+      This screen has been verified — the deterministic runner uses the recipe extracted
+      from a successful Claude Code run, including any per-screen quirks the agent had
+      to work around. ~30–60s per run, $0.
+    {% else %}
+      First runs use Claude Code (subscription quota, ~5–15 min) so the agent can adapt
+      to anything unusual. After a successful run you'll be prompted to verify; that
+      unlocks the deterministic runner (~30–60s, free) for all subsequent runs.
+    {% endif %}
+    <strong>The browser opens on this machine</strong>. Point at non-prod for early runs.
+  </p>
+
+  {% if not runner_cli_ok %}
+    <div class="flash error" style="margin-bottom:0">
+      <strong>Claude Code CLI not found on PATH.</strong>
+      Install with <span class="mono">npm i -g @anthropic-ai/claude-code</span>, then reload this page.
+    </div>
+  {% elif not runner_cfg_ok %}
+    <div class="flash error" style="margin-bottom:0">
+      <strong>Missing env vars in <span class="mono">.env</span>:</strong>
+      <span class="mono">{{ runner_cfg_missing | join(', ') }}</span>.
+      Copy <span class="mono">.env.example</span> to <span class="mono">.env</span> at the project root and fill it in.
+    </div>
+  {% else %}
+    <div class="muted" style="font-size:12.5px; margin-bottom:10px">
+      Will run as <span class="mono">{{ screen.function_id }}</span> against
+      <span class="mono">{{ runner_cfg_ok and (config_base_url or '$BASE_URL') }}</span>.
+      Maker-checker stops after the maker save — re-run later as the checker user.
+    </div>
+  {% endif %}
+
+  {% if runs %}
+    <h3 style="margin-top:18px">Recent runs</h3>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Status</th><th>Started (UTC)</th><th>Finished</th><th>Exit</th><th>Target</th><th></th></tr>
+      </thead>
+      <tbody>
+        {% for r in runs %}
+          <tr>
+            <td class="mono">{{ r.id }}</td>
+            <td>
+              <span class="pill {% if r.status == 'completed' %}ok{% elif r.status in ('failed', 'stopped') %}warn{% endif %}">
+                {{ r.status }}
+              </span>
+            </td>
+            <td class="mono muted">{{ r.started_at }}</td>
+            <td class="mono muted">{{ r.finished_at or '—' }}</td>
+            <td class="mono">{{ r.exit_code if r.exit_code is not none else '—' }}</td>
+            <td class="mono muted" style="max-width:240px; overflow:hidden; text-overflow:ellipsis;">
+              {{ r.base_url or '—' }}
+            </td>
+            <td><a class="btn ghost" href="{{ url_for('run_detail', screen_id=screen.id, run_id=r.id) }}">Open</a></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+<script>
+  function confirmRun(mode) {
+    return confirm(
+      "About to launch a real browser (" + mode + ") and drive your FLEXCUBE.\n\n" +
+      "Make sure you're pointed at a NON-PROD environment for early runs.\n\n" +
+      "Continue?"
+    );
+  }
+</script>
 {% else %}
 <div class="panel">
   <h3 style="margin-top:0">No plan generated yet</h3>

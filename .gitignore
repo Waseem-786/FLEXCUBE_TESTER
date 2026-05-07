@@ -20,6 +20,16 @@ screens.db
 *.db-shm
 *.db-wal
 
+# Plan-execution artifacts (logs + screenshots) — per-developer, large, regenerable
+runs/
+
+# User-uploaded Excel files for the bulk-load workflow.
+uploads/
+
+# Playwright MCP server's session cache (page snapshots, console logs).
+# Recreated automatically every run.
+.playwright-mcp/
+
 # Smoke-test artifacts (Playwright + temp scripts)
 _pw_*.png
 _pw_*.py

@@ -25,8 +25,10 @@
     {% if is_readonly %}<br><span class="pill">readonly</span>{% endif %}
   </td>
   <td class="cell-action">
-    {# Action mode select — options depend on datatype #}
-    <select name="mode_{{ key }}" class="mode-select">
+    {# Action mode select — options depend on datatype.
+       `form="form-generate"` ties this input to the generate form even
+       though, in the DOM, the select sits outside any <form> element. #}
+    <select name="mode_{{ key }}" class="mode-select" form="form-generate">
       {% if is_checkbox %}
         <option value="tick"   {% if prior and prior.mode == 'tick' %}selected{% endif %}>Tick</option>
         <option value="untick" {% if prior and prior.mode == 'untick' %}selected{% endif %}>Untick</option>
@@ -53,6 +55,13 @@
           <option value="skip" {% if prior and prior.mode == 'skip' %}selected{% endif %}>Skip</option>
         {% endif %}
       {% endif %}
+      {# Bulk-load mode: every non-readonly field can be sourced from a column
+         in the uploaded Excel. The submit handler converts mode='excel' into
+         a per-row substitution at compose time. #}
+      {% if not is_readonly %}
+        <option value="excel" {% if prior and prior.mode == 'excel' %}selected{% endif %}
+                data-bulk-only="1">From Excel column</option>
+      {% endif %}
     </select>
   </td>
   <td class="cell-value">
@@ -60,7 +69,7 @@
     {% if is_checkbox %}
       <span class="muted">— no value needed —</span>
     {% elif is_dropdown and field.options %}
-      <select name="value_{{ key }}">
+      <select name="value_{{ key }}" form="form-generate">
         <option value="">— pick option —</option>
         {% for opt in field.options or [] %}
           <option value="{{ opt.value }}" {% if prior and prior.value == opt.value %}selected{% endif %}>
@@ -69,17 +78,17 @@
         {% endfor %}
       </select>
     {% elif is_lov %}
-      <input type="text" name="value_{{ key }}"
+      <input type="text" name="value_{{ key }}" form="form-generate"
              placeholder="row-matching value (e.g. USD)"
              value="{{ (prior.value if prior else '') or '' }}">
     {% elif is_date %}
-      <input type="date" name="value_{{ key }}"
+      <input type="date" name="value_{{ key }}" form="form-generate"
              value="{{ (prior.value if prior else '') or '' }}">
     {% elif is_number %}
-      <input type="number" name="value_{{ key }}" step="any"
+      <input type="number" name="value_{{ key }}" step="any" form="form-generate"
              value="{{ (prior.value if prior else '') or '' }}">
     {% else %}
-      <input type="text" name="value_{{ key }}"
+      <input type="text" name="value_{{ key }}" form="form-generate"
              {% if field.length %}maxlength="{{ field.length }}"{% endif %}
              value="{{ (prior.value if prior else '') or '' }}">
     {% endif %}
@@ -104,15 +113,25 @@
   </div>
 </div>
 
-<form method="post" action="{{ url_for('screen_generate', screen_id=screen.id) }}">
+{# The "form" attribute pattern: this empty <form id="form-generate"> owns
+   every input/select on the page that carries form="form-generate". This
+   lets the Excel-upload sub-form below sit as a sibling rather than
+   nested inside the Generate form (nested forms are invalid HTML — the
+   browser silently merges them, which previously caused the upload click
+   to actually submit to /generate). #}
+<form id="form-generate"
+      method="post"
+      action="{{ url_for('screen_generate', screen_id=screen.id) }}"></form>
 
 <div class="panel">
   <h3 style="margin-top:0">Workflow mode</h3>
   <div class="workflow-modes">
+    {% set ENABLED_MODES = ['create_new', 'bulk_load'] %}
     {% for mode_key, label in workflow_modes.items() %}
-      {% set disabled = (mode_key != 'create_new') %}
+      {% set disabled = mode_key not in ENABLED_MODES %}
       <label class="mode-radio {% if disabled %}disabled{% endif %}">
         <input type="radio" name="workflow_mode" value="{{ mode_key }}"
+               form="form-generate"
                {% if mode_key == active_mode %}checked{% endif %}
                {% if disabled %}disabled{% endif %}>
         {{ label }}
@@ -120,10 +139,112 @@
     {% endfor %}
   </div>
   <p class="muted" style="margin:10px 0 0 0; font-size:12.5px">
-    v1 supports <strong>Create New</strong>. The other modes are stubbed.
+    Supported now: <strong>Create New</strong> &amp; <strong>Bulk Load from Excel</strong>.
+    Copy &amp; Modify are stubbed.
   </p>
 </div>
 
+{# ---- Bulk-load: visible only when bulk_load is the active mode ---- #}
+<div id="bulk-load-section" class="panel"
+     style="display: {% if active_mode == 'bulk_load' %}block{% else %}none{% endif %}">
+  <h3 style="margin-top:0">Bulk Load — Excel data</h3>
+  <p class="muted" style="margin:0 0 14px; font-size:13px">
+    Every non-readonly field on the screen is automatically a column in
+    the template — no per-field setup. Download, fill, upload, generate.
+    Empty cells are skipped per row.
+  </p>
+
+  {% set bulk_fields = screen.fields | rejectattr('readonly') | list %}
+  <div class="muted" style="margin-bottom:14px; font-size:12.5px">
+    <strong>Template will have {{ bulk_fields | length }} column(s)</strong>:
+    {% for f in bulk_fields %}
+      <span class="pill" style="margin: 1px 2px;">
+        <span class="mono">{{ f.name }}</span>
+        {% if f.lov %}· LOV{% elif (f.datatype or '')|upper == 'CHECKBOX' %}· Yes/No{% elif (f.datatype or '')|upper == 'DATE' %}· date{% elif (f.datatype or '')|upper == 'NUMBER' %}· number{% elif (f.datatype or '')|upper in ('DROPDOWN','RADIO') %}· dropdown{% endif %}
+      </span>
+    {% endfor %}
+  </div>
+
+  <div class="grid-2">
+    <div>
+      <h3 style="margin-top:0; font-size:12.5px;">1 · Download empty template</h3>
+      <p class="muted" style="margin:0 0 8px; font-size:12.5px">
+        Columns are auto-derived from your "From Excel" picks below. Re-download
+        after changing them.
+      </p>
+      <a class="btn ghost" href="{{ url_for('screen_excel_template', screen_id=screen.id) }}">
+        ⬇ Download <span class="mono">{{ screen.function_id }}.bulk_template.xlsx</span>
+      </a>
+    </div>
+
+    <div>
+      <h3 style="margin-top:0; font-size:12.5px;">2 · Upload filled template</h3>
+      {% if screen.excel_filename %}
+        <div class="meta-row" style="margin-bottom:8px">
+          <span class="pill ok">✓ uploaded</span>
+          <span class="mono">{{ screen.excel_filename }}</span>
+          <span class="muted" style="font-size:12.5px">
+            · {{ screen.excel_row_count }} row(s) · {{ screen.excel_uploaded_at }}
+          </span>
+          <form method="post" action="{{ url_for('screen_excel_clear', screen_id=screen.id) }}"
+                style="display:inline; margin-left:6px"
+                onsubmit="return confirm('Clear this Excel upload?');">
+            <button type="submit" class="ghost" style="padding:2px 8px; font-size:11.5px;">Clear</button>
+          </form>
+        </div>
+      {% else %}
+        <p class="muted" style="margin:0 0 8px; font-size:12.5px">
+          No file uploaded yet. Generate-without-upload still works but the plan
+          body will be a TODO until a file is provided.
+        </p>
+      {% endif %}
+      <form method="post" action="{{ url_for('screen_excel_upload', screen_id=screen.id) }}"
+            enctype="multipart/form-data" style="display:flex; gap:8px; align-items:center;">
+        <input type="file" name="excel" accept=".xlsx" required style="flex:1">
+        <button type="submit" class="ghost">Upload</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+  // Toggle the bulk-load section + lock/unlock per-field "From Excel" option
+  // based on the workflow_mode radio. Wrapped in DOMContentLoaded because
+  // the field-blocks div appears later in the document — without the wait
+  // it'd be null when this IIFE runs inline.
+  document.addEventListener('DOMContentLoaded', () => {
+    const section = document.getElementById('bulk-load-section');
+    const fieldBlocks = document.getElementById('field-blocks');
+    function sync() {
+      const mode = (document.querySelector('input[name="workflow_mode"]:checked') || {}).value;
+      const isBulk = (mode === 'bulk_load');
+      section.style.display = isBulk ? 'block' : 'none';
+      // Bulk mode: every non-readonly field is auto-included in the
+      // template. Hide the per-field tables entirely so the user only sees
+      // the bulk panel above.
+      if (fieldBlocks) {
+        fieldBlocks.style.display = isBulk ? 'none' : '';
+      }
+      // (Legacy: when switching out of bulk mode, fall any 'excel'-mode
+      // field selects back to a sane value. Kept as a safety net.)
+      for (const opt of document.querySelectorAll('option[data-bulk-only="1"]')) {
+        opt.hidden = !isBulk;
+        opt.disabled = !isBulk;
+        if (!isBulk && opt.selected) {
+          const sel = opt.parentElement;
+          for (const o of sel.options) {
+            if (!o.hidden && !o.disabled) { sel.value = o.value; break; }
+          }
+        }
+      }
+    }
+    document.querySelectorAll('input[name="workflow_mode"]').forEach(r =>
+      r.addEventListener('change', sync));
+    sync();
+  });
+</script>
+
+<div id="field-blocks">
 {% for block in screen.blocks %}
   {% set block_fields = screen.fields | selectattr('block_name', 'equalto', block.name) | list %}
   {% if block_fields %}
@@ -163,18 +284,17 @@
     </div>
   {% endif %}
 {% endfor %}
+</div>{# /#field-blocks #}
 
 <div class="panel" style="position:sticky; bottom:0; z-index:5;">
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-    <button type="submit">Generate CLAUDE.md</button>
+    <button type="submit" form="form-generate">Generate CLAUDE.md</button>
     <a href="{{ url_for('screen_detail', screen_id=screen.id) }}" class="btn ghost">Cancel</a>
     <span class="muted" style="font-size:12.5px">
       Required fields cannot be skipped. Read-only fields are auto-populated by FLEXCUBE.
     </span>
   </div>
 </div>
-
-</form>
 
 <style>
   .review-table { width: 100%; border-collapse: collapse; }
