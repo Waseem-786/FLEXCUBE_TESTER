@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Settings — FLEXCUBE Screen Tester{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h2 style="margin:0 0 6px">Project settings</h2>
+  <p class="muted" style="margin:0; font-size:13px">
+    These values flow into both runners (Claude Code &amp; deterministic) when
+    you click Run plan. They're saved into <span class="mono">screens.db</span>
+    (gitignored). The legacy <span class="mono">.env</span> file at the project
+    root still works as a fallback for any value left blank below.
+  </p>
+</div>
+
+<form method="post" action="{{ url_for('settings_save') }}">
+  <div class="panel">
+    <h3 style="margin-top:0">FLEXCUBE — maker user (required)</h3>
+    <p class="muted" style="margin:0 0 14px; font-size:12.5px">
+      The agent uses this account to log in and create the record. All three
+      values are needed before either Run-plan button enables.
+    </p>
+
+    <div class="grid-2">
+      <label>
+        <span>Base URL</span>
+        <input type="text" name="FLEXCUBE_BASE_URL"
+               placeholder="https://your-flexcube-host:7034/FCJNeoWeb/SMMDIFRM.jsp"
+               value="{{ saved.FLEXCUBE_BASE_URL or '' }}">
+      </label>
+      <label>
+        <span>User ID</span>
+        <input type="text" name="FLEXCUBE_USERNAME"
+               value="{{ saved.FLEXCUBE_USERNAME or '' }}">
+      </label>
+    </div>
+
+    <label>
+      <span>Password</span>
+      <input type="password" name="FLEXCUBE_PASSWORD"
+             value="{{ saved.FLEXCUBE_PASSWORD or '' }}">
+    </label>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin-top:0">FLEXCUBE — checker user (optional)</h3>
+    <p class="muted" style="margin:0 0 14px; font-size:12.5px">
+      Only needed for the maker-checker authorize step. v1 stops after the
+      maker save; leave blank if you don't need authorize today.
+    </p>
+
+    <div class="grid-2">
+      <label>
+        <span>User ID</span>
+        <input type="text" name="FLEXCUBE_ACCORDER_AUTH_USERNAME"
+               value="{{ saved.FLEXCUBE_ACCORDER_AUTH_USERNAME or '' }}">
+      </label>
+      <label>
+        <span>Password</span>
+        <input type="password" name="FLEXCUBE_ACCORDER_AUTH_PASSWORD"
+               value="{{ saved.FLEXCUBE_ACCORDER_AUTH_PASSWORD or '' }}">
+      </label>
+    </div>
+  </div>
+
+  <div class="panel" style="position:sticky; bottom:0; z-index:5;">
+    <div style="display:flex; gap:10px; align-items:center;">
+      <button type="submit">Save settings</button>
+      <a href="{{ url_for('index') }}" class="btn ghost">Cancel</a>
+
+      {% if cfg_ok %}
+        <span class="pill ok">✓ ready to run</span>
+      {% else %}
+        <span class="pill warn">missing: {{ cfg_missing | join(', ') }}</span>
+      {% endif %}
+    </div>
+    <p class="muted" style="margin:10px 0 0; font-size:12.5px">
+      Passwords are stored unencrypted in <span class="mono">screens.db</span>
+      (gitignored). Same security profile as a <span class="mono">.env</span>
+      file. Don't commit the DB.
+    </p>
+  </div>
+</form>
+{% endblock %}

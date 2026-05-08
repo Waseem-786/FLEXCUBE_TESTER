@@ -50,14 +50,21 @@ def generate_claude_md(
     decisions: list[dict],
     *,
     excel_rows: list[dict] | None = None,
+    grid_rows: dict[str, list[dict]] | None = None,
+    excel_grid_rows: dict[str, list[dict]] | None = None,
 ) -> str:
+    """`grid_rows` (Create New): {block_name: [{field_name: value, ...}, ...]}.
+    `excel_grid_rows` (Bulk Load): same shape but read from per-grid Excel
+    sheets; bulk composer groups by master key."""
     if workflow_mode == "bulk_load":
-        return _generate_bulk_load(screen, decisions, excel_rows or [])
+        return _generate_bulk_load(screen, decisions, excel_rows or [],
+                                    excel_grid_rows or {})
     if workflow_mode != "create_new":
         raise ValueError(
             f"workflow_mode={workflow_mode!r} is not implemented; "
             f"supported modes are 'create_new' and 'bulk_load'."
         )
+    grid_rows = grid_rows or {}
 
     fid = screen["function_id"]
     name = screen["name"]
@@ -95,6 +102,10 @@ def generate_claude_md(
         "- Navigate to base_url",
         "- Enter username and password",
         "- Click **Sign In**",
+        "- **If a session-conflict prompt appears** (e.g. *\"User is already logged in. "
+          "Re-enter password to clear previous session.\"* or similar), re-enter the same "
+          "password and click **OK** / **Continue** / **Yes**. This kicks the prior session "
+          "out and proceeds with the new login.",
         "",
     ])
 
@@ -142,7 +153,12 @@ def generate_claude_md(
 
     for grid in grid_blocks:
         grid_fields = [f for f in fields if f["block_name"] == grid["name"]]
-        grid_lines = _render_grid_actions(grid, grid_fields, decisions_by_key)
+        if _all_readonly(grid_fields):
+            # Pure read-only grid (e.g. FST_HIST "Previous Values"
+            # auto-populated by FLEXCUBE) — nothing for the user to fill.
+            continue
+        rows = grid_rows.get(grid["name"]) or []
+        grid_lines = _render_grid_rows(grid, grid_fields, rows)
         if not grid_lines:
             continue
         out.append(step.heading(f"Add Rows to {grid['label'] or grid['name']}"))
@@ -282,29 +298,59 @@ def _render_block_actions(
     return lines
 
 
-def _render_grid_actions(
+def _all_readonly(fields: list[dict]) -> bool:
+    """A grid block where every field is read-only (FCJNeoWeb auto-populates
+    them) — exclude entirely from the workflow, the review form, and the
+    Excel template."""
+    return bool(fields) and all(f.get("readonly") for f in fields)
+
+
+def _render_grid_rows(
     grid: dict,
     grid_fields: list[dict],
-    decisions_by_key: dict,
+    rows: list[dict],
 ) -> list[str]:
-    """Multi-entry grid: one Add-Row block, with each field action nested.
-    For v1 this describes ONE row; the closing line tells the runner to
-    repeat for each additional input row."""
-    inner: list[str] = []
-    for f in grid_fields:
-        decision = decisions_by_key.get((grid["name"], f["name"]))
-        if not decision or decision["mode"] == "skip":
-            continue
-        # Each grid action is rendered as a sub-bullet under "In the new row:"
-        inner.extend("  " + line for line in _field_action_lines(f, decision))
-    if not inner:
+    """Render N rows of an editable grid as one Add-Row block per row.
+    `rows` = [{field_name: value, ...}, ...]. Empty list → no output (the
+    grid is skipped). Read-only grid columns are silently dropped."""
+    if not rows:
         return []
-    return [
-        "- Click the **+** (Add Row) button on the grid.",
-        "- In the new row:",
-        *inner,
-        "- Repeat the Add-Row sequence for each additional input row.",
-    ]
+    editable = [f for f in grid_fields if not f.get("readonly")]
+    out: list[str] = []
+    for i, row in enumerate(rows, start=1):
+        # If every value in this row is empty, skip the row entirely so the
+        # user doesn't have to manually trim trailing-empty grid editors.
+        if not any((row.get(f["name"]) or "").strip()
+                   if isinstance(row.get(f["name"]), str)
+                   else row.get(f["name"]) not in (None, "")
+                   for f in editable):
+            continue
+        out.append(f"- Click the **+** (Add Row) button on the grid (row {i}).")
+        out.append("- In the new row:")
+        for f in editable:
+            cell = row.get(f["name"])
+            if cell in (None, ""):
+                continue
+            decision = _cell_to_decision(f, cell)
+            for line in _field_action_lines(f, decision):
+                out.append("  " + line)
+    return out
+
+
+def _cell_to_decision(field: dict, cell) -> dict:
+    """Turn a single cell value into the decision shape `_field_action_lines`
+    expects. Same type-aware mapping as the bulk-load materialiser."""
+    cell_str = str(cell).strip()
+    datatype = (field.get("datatype") or "").upper()
+    if field.get("lov"):
+        return {"mode": "lov_match", "value": cell_str}
+    if datatype == "CHECKBOX":
+        if cell_str.upper() in _CHECKBOX_TRUTHY:
+            return {"mode": "tick", "value": None}
+        return {"mode": "skip", "value": None}
+    if datatype in ("DROPDOWN", "RADIO"):
+        return {"mode": "option", "value": cell_str}
+    return {"mode": "value", "value": cell_str}
 
 
 def _field_action_lines(field: dict, decision: dict | None) -> list[str]:
@@ -384,7 +430,9 @@ def _generate_bulk_load(
     screen: dict,
     decisions: list[dict],
     excel_rows: list[dict],
+    excel_grid_rows: dict[str, list[dict]] | None = None,
 ) -> str:
+    excel_grid_rows = excel_grid_rows or {}
     """Compose a CLAUDE.md that creates ONE record per row in the uploaded
     Excel file. Each row's body reuses the create_new rendering — login,
     Save, validation, and authorize steps appear ONCE at the top/bottom and
@@ -441,6 +489,10 @@ def _generate_bulk_load(
         "- Navigate to base_url",
         "- Enter username and password",
         "- Click **Sign In**",
+        "- **If a session-conflict prompt appears** (e.g. *\"User is already logged in. "
+          "Re-enter password to clear previous session.\"* or similar), re-enter the same "
+          "password and click **OK** / **Continue** / **Yes**. This kicks the prior session "
+          "out and proceeds with the new login.",
         "",
     ])
     out.append(step.heading("Post-login Handling"))
@@ -473,10 +525,19 @@ def _generate_bulk_load(
             if not block_fields:
                 continue
             if block["is_grid"]:
-                out.append(
-                    f"- <!-- TODO: grid block **{block['label'] or block['name']}** "
-                    f"is not handled by bulk-load v1. Fill manually if needed. -->"
+                if _all_readonly(block_fields):
+                    continue
+                grid_for_master = _filter_grid_rows_for_master(
+                    excel_grid_rows.get(block["name"]) or [], i,
                 )
+                if not grid_for_master:
+                    continue
+                grid_lines = _render_grid_rows(block, block_fields, grid_for_master)
+                if grid_lines:
+                    out.append(f"  Grid: {block['label'] or block['name']}")
+                    for line in grid_lines:
+                        # nest under the row's bullet structure
+                        out.append("  " + line if line.startswith("- ") else line)
                 continue
 
             for f in block_fields:
@@ -540,6 +601,58 @@ def _generate_bulk_load(
 
 
 _CHECKBOX_TRUTHY = {"YES", "Y", "TRUE", "1", "TICK", "TICKED", "CHECKED"}
+
+
+def _filter_grid_rows_for_master(
+    grid_rows: list[dict],
+    master_index_1based: int,
+) -> list[dict]:
+    """For bulk-load: pick the grid rows belonging to master record #N.
+
+    Three behaviours, in priority order:
+
+      • No `MASTER_KEY` column on the grid sheet at all → every row
+        applies to every master (template / single-master case).
+
+      • Row's `MASTER_KEY` is **blank** → that row is a template row and
+        applies to every master record. This is the recommended default
+        for screens like IADASFNL where the same fund-allocation grid
+        is repeated for each asset.
+
+      • Row's `MASTER_KEY` is filled with `1`/`2`/… → that row is linked
+        ONLY to the master record at that 1-based row number. Use this
+        when different masters need different grid rows.
+    """
+    if not grid_rows:
+        return []
+    if "MASTER_KEY" not in (grid_rows[0] if grid_rows else {}):
+        return grid_rows
+    target = str(master_index_1based)
+    out: list[dict] = []
+    for g in grid_rows:
+        key = _normalize_master_key(g.get("MASTER_KEY"))
+        if not key:
+            # Blank → broadcast to every master.
+            out.append(g)
+        elif key == target:
+            out.append(g)
+    return out
+
+
+def _normalize_master_key(v) -> str:
+    """Excel sometimes coerces '1' to 1.0 in number-format columns; openpyxl
+    then stringifies as '1' via _coerce. We re-normalise here so '1', '1.0',
+    1, and 1.0 all match each other."""
+    if v in (None, ""):
+        return ""
+    s = str(v).strip()
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except (TypeError, ValueError):
+        pass
+    return s
 
 
 def _materialise_for_row(
@@ -615,6 +728,47 @@ def _bulk_empty_plan(fid: str, name: str, decisions: list[dict]) -> str:
         f"Review page, then click Generate again. -->",
         "",
     ])
+
+
+GRID_MAX_ROWS = 20  # cap rows per grid editor in the Review UI
+
+
+def parse_grid_decisions_from_form(
+    blocks: list[dict],
+    fields: list[dict],
+    form,
+    *,
+    max_rows: int = GRID_MAX_ROWS,
+) -> dict[str, list[dict]]:
+    """Translate the grid mini-editor's form keys into structured rows:
+
+        grid_<BLOCK>_<ROW_IDX>_<FIELD>=value
+            ↓
+        { block_name: [ { field_name: value, ... }, ... ] }
+
+    Read-only-only grids are skipped entirely (no editor was rendered).
+    Rows where every cell is empty are dropped, so trailing-empty editor
+    rows don't manufacture phantom Add-Row steps in the plan."""
+    out: dict[str, list[dict]] = {}
+    for block in blocks:
+        if not block.get("is_grid"):
+            continue
+        gfields = [f for f in fields
+                   if f["block_name"] == block["name"] and not f.get("readonly")]
+        if not gfields:
+            continue
+        rows: list[dict] = []
+        for row_idx in range(max_rows):
+            row = {}
+            for f in gfields:
+                key = f"grid_{block['name']}_{row_idx}_{f['name']}"
+                v = (form.get(key) or "").strip()
+                if v:
+                    row[f["name"]] = v
+            if row:
+                rows.append(row)
+        out[block["name"]] = rows
+    return out
 
 
 def parse_decisions_from_form(fields: list[dict], form) -> list[dict]:

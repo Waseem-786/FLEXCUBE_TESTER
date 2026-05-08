@@ -8,8 +8,11 @@ Claude Code (the LLM agent) or a deterministic Python Playwright runner.
 > **Status**: end-to-end working for **Create New** and **Bulk Load from Excel**
 > on both UIXML dialects we've seen (attribute-based and the real FLEXCUBE
 > child-element export). Both runners are live (LLM agent + selectors-from-a-
-> verified-run). Copy / Modify workflows and the maker-checker authorize half
-> of execution are roadmap.
+> verified-run). Multi-row grid blocks supported in both runners and in the
+> bulk-load Excel template (one sheet per grid). Verified Claude Code runs
+> capture both selector overrides AND a full Playwright action recording the
+> deterministic runner can replay step-by-step. Copy / Modify workflows and
+> the maker-checker authorize half of execution are roadmap.
 
 ---
 
@@ -42,13 +45,18 @@ For plan **execution** you also need:
 # Claude Code CLI (used by the LLM-agent runner)
 npm install -g @anthropic-ai/claude-code
 
-# Playwright Chromium (used by the deterministic runner)
+# Playwright Chromium (used by the deterministic runner). Real Chrome
+# is preferred — the deterministic runner tries channel="chrome" first
+# (FCJNeoWeb's accessibility tree exposes Fast Path differently in
+# real Chrome vs. bundled Chromium). Edge and bundled Chromium are
+# automatic fallbacks.
 python -m playwright install chromium
-
-# Per-project credentials — copy and fill in
-copy .env.example .env
-notepad .env
 ```
+
+Configure runtime credentials via the **Settings** page in the app
+(gear icon, top-right) — values persist into the local `screens.db`
+and survive restarts. A `.env` file with the same `FLEXCUBE_*` keys is
+still picked up as a fallback if Settings is empty.
 
 The Playwright MCP server is already declared in [.mcp.json](.mcp.json) at
 the project root, so no `claude mcp add` step is needed.
@@ -81,6 +89,16 @@ LOVs). Required fields can't be skipped; readonly fields are dimmed.
 
 **Bulk Load** — click *Download template*, fill in your data offline,
 *Upload* the filled file. The page shows ✓ uploaded · N rows once it lands.
+The template is **multi-sheet** when the screen has editable grid blocks:
+a `Master` sheet for the master block plus one sheet per grid. Grid sheets
+lead with a `MASTER_KEY` column — leave it blank to broadcast the row to
+every master, or fill `1` / `2` / `3` to attach a grid row to a specific
+master record (1-based row index of the Master sheet).
+
+**Grids in Create New** — editable grids render as a mini-table with
+`+ Add row` / `× remove` buttons. Read-only-only grids (e.g. a History
+panel auto-populated by FLEXCUBE) are omitted from the form, the plan,
+and the Excel template.
 
 ### 4. Generate
 
@@ -99,9 +117,18 @@ The detail page has two execution paths:
 
 The deterministic button is **locked** until the screen has been verified.
 Verification: after a successful Claude Code run, click **Verify & save
-recipe** on the run page. The app parses the run log and saves a per-screen
-selector recipe (checkbox click strategies, LOV iframe titles, …) the
-deterministic runner uses on subsequent runs.
+recipe** on the run page. The app parses the run log and saves both:
+
+- **Selector overrides** — checkbox click strategies, LOV iframe titles,
+  the screen iframe's numeric name. The deterministic runner's selector
+  helpers consult these per-call.
+- **Step recordings** — a structured form of every Playwright action the
+  agent ran, grouped by step title. The compiler swaps any title outside
+  its typed-step set (Login / Fast Path / Save / field fills / grid Add Row
+  …) for a single `replay_step` so unanticipated detours the agent took
+  (a confirmation popup, a tab switch) are reproduced verbatim. Typed
+  boilerplate keeps using its multi-strategy selectors so the runner stays
+  resilient to cross-session DOM variance.
 
 The browser opens **headed** in both cases — you watch it work, with a
 Stop button live in the UI.
@@ -213,21 +240,28 @@ uploads with verified-state badges so persistence is visible immediately.
 ├── claude_md_generator.py       (screen, decisions, mode, excel_rows) → CLAUDE.md
 ├── plan_compiler.py             (screen, decisions, mode, excel_rows) →
 │                                structured step list for the deterministic runner
-├── recipe_extractor.py          Parse a stream-json log → checkbox strategies +
-│                                LOV iframe titles + screen-iframe hint
-├── excel_handler.py             write_template + read_uploaded for bulk-load
+├── recipe_extractor.py          Parse a stream-json log → selector overrides +
+│                                step_recordings (structured Playwright actions
+│                                the deterministic runner can replay)
+├── excel_handler.py             Multi-sheet template I/O — Master sheet plus
+│                                one sheet per editable grid block, MASTER_KEY
+│                                column to join grid rows to master rows.
 ├── templates/
 │   ├── base.html                Layout + dark-theme CSS
 │   ├── index.html               Upload form + recent screens
 │   ├── review.html              Per-field review (Create New + Bulk Load UIs)
 │   ├── screen.html              Detail + generated plan + Run buttons + run history
 │   ├── run.html                 Live run page (SSE event stream + screenshots)
-│   └── screens.html             History
+│   ├── screens.html             History
+│   └── settings.html            Runtime credentials form (FLEXCUBE_* values
+│                                persist into the kv table; canonical for
+│                                runtime_config())
 ├── samples/                     Real FLEXCUBE artifacts to test against
 │   ├── IADFNONL.UIXML/.js       Old attribute-based dialect (illustrative)
 │   ├── IADPRFNL.xml/.js         Real FLEXCUBE child-element dialect
 │   ├── IADPBALO.xml/.js         Real FLEXCUBE child-element dialect
 │   ├── IADSKINP.xml/.js         Real FLEXCUBE child-element dialect
+│   ├── IADASFNL.xml/.js         Real FLEXCUBE — has an editable grid block
 │   ├── CLAUDE.md                Team's hand-written reference plan
 │   └── SAMPLE_TEST_THROUGH_CLAUDE_CODE.txt
 │                                The Claude Code run log the deterministic
@@ -249,10 +283,12 @@ In rough order:
 1. **Copy-Existing workflow** — query existing record, click Copy, override key, save.
 2. **Modify workflow** — query, Unlock, edit, save.
 3. **Maker-checker dual-session execution** — currently the runner stops after
-   the maker save; v1.5 should launch a second Chromium as the checker user
-   and complete the authorize step in one run.
-4. **Bulk-load: grid blocks** — multi-sheet templates (one sheet per grid),
-   key-column to group rows.
+   the maker save; should launch a second Chromium as the checker user and
+   complete the authorize step in one run.
+4. **Replay value-substitution** — v1 of `replay_step` only swaps placeholder
+   credentials. Future: pair each recorded step with the original plan's args
+   so a Bulk Load row can replay an exact recorded sequence with the new
+   row's value substituted for the recorded one.
 5. **Negative & edge test cases** — append a `## Test Cases` section to generated plans.
 6. **Two-version diff** — pick two uploads of the same screen and render a
    side-by-side change report (the killer use case for patch upgrades).

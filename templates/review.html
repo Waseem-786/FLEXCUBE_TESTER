@@ -247,24 +247,116 @@
 <div id="field-blocks">
 {% for block in screen.blocks %}
   {% set block_fields = screen.fields | selectattr('block_name', 'equalto', block.name) | list %}
-  {% if block_fields %}
+  {% if not block_fields %}{# nothing to render #}
+  {% elif block.is_grid %}
+    {# Grid block: skip if every field is read-only (FLEXCUBE auto-populates).
+       Otherwise render a wide editable mini-table. #}
+    {% set editable_grid_fields = block_fields | rejectattr('readonly') | list %}
+    {% if editable_grid_fields %}
+      {% set prior_rows = (prior_grid_decisions or {}).get(block.name) or [] %}
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+          <h3 style="margin:0">
+            {{ block.label or block.name }}
+            <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span>
+          </h3>
+          <div>
+            <span class="pill">grid · multi-row</span>
+            <span class="muted" style="font-size:12.5px">{{ editable_grid_fields|length }} editable column(s)</span>
+          </div>
+        </div>
+        <p class="muted" style="margin:6px 0 10px; font-size:12.5px">
+          Add zero or more rows. Empty rows are skipped. Read-only columns are auto-populated by FLEXCUBE
+          and don't appear here.
+        </p>
+
+        <table class="grid-editor" data-block="{{ block.name }}"
+               style="margin-top:8px">
+          <thead>
+            <tr>
+              {% for f in editable_grid_fields %}
+                <th>
+                  {{ f.label or f.name }}
+                  <div class="mono muted" style="font-size:11px; font-weight:400;">
+                    {{ f.name }}
+                    {% if f.lov %}· LOV{% endif %}
+                    {% if f.required %}· required{% endif %}
+                  </div>
+                </th>
+              {% endfor %}
+              <th style="width:32px"></th>
+            </tr>
+          </thead>
+          <tbody class="grid-rows">
+            {# Always render at least one starter row so the JS clone target
+               exists. An empty row is dropped by the server-side parser. #}
+            {% set rows_to_render = prior_rows if prior_rows else [{}] %}
+            {% for row in rows_to_render %}
+              {% set row_idx = loop.index0 %}{# alias outer loop, inner uses its own loop #}
+              <tr class="grid-row" data-row-idx="{{ row_idx }}">
+                {% for f in editable_grid_fields %}
+                  <td>
+                    {% set ftype = (f.datatype or '')|upper %}
+                    {% if ftype == 'DATE' %}
+                      <input type="date"
+                             name="grid_{{ block.name }}_{{ row_idx }}_{{ f.name }}"
+                             value="{{ row.get(f.name) or '' }}"
+                             form="form-generate">
+                    {% elif ftype == 'NUMBER' %}
+                      <input type="number" step="any"
+                             name="grid_{{ block.name }}_{{ row_idx }}_{{ f.name }}"
+                             value="{{ row.get(f.name) or '' }}"
+                             form="form-generate">
+                    {% elif ftype in ('DROPDOWN', 'RADIO') and f.options %}
+                      <select name="grid_{{ block.name }}_{{ row_idx }}_{{ f.name }}"
+                              form="form-generate">
+                        <option value="">—</option>
+                        {% for opt in f.options %}
+                          <option value="{{ opt.value }}"
+                                  {% if row.get(f.name) == opt.value %}selected{% endif %}>
+                            {{ opt.label }} ({{ opt.value }})
+                          </option>
+                        {% endfor %}
+                      </select>
+                    {% else %}
+                      <input type="text"
+                             name="grid_{{ block.name }}_{{ row_idx }}_{{ f.name }}"
+                             value="{{ row.get(f.name) or '' }}"
+                             {% if f.lov %}placeholder="row-matching value (LOV)"{% endif %}
+                             form="form-generate">
+                    {% endif %}
+                  </td>
+                {% endfor %}
+                <td><button type="button" class="grid-remove" title="Remove this row">×</button></td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+
+        <button type="button" class="btn ghost grid-add" data-block="{{ block.name }}" style="margin-top:10px">
+          + Add row
+        </button>
+      </div>
+    {% else %}
+      {# All-readonly grid (e.g. FST_HIST). Show a tiny note so the user
+         knows it's intentionally absent, no input box. #}
+      <div class="panel" style="opacity:0.7">
+        <h3 style="margin:0">{{ block.label or block.name }}
+          <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span></h3>
+        <p class="muted" style="margin:6px 0 0; font-size:12.5px">
+          Read-only grid — auto-populated by FLEXCUBE. No input needed; this block is omitted from the plan.
+        </p>
+      </div>
+    {% endif %}
+  {% else %}
     <div class="panel">
       <div style="display:flex; justify-content:space-between; align-items:baseline;">
         <h3 style="margin:0">
           {{ block.label or block.name }}
           <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span>
         </h3>
-        <div>
-          {% if block.is_grid %}<span class="pill">grid · multi-row</span>{% endif %}
-          <span class="muted" style="font-size:12.5px">{{ block_fields|length }} fields</span>
-        </div>
+        <span class="muted" style="font-size:12.5px">{{ block_fields|length }} fields</span>
       </div>
-      {% if block.is_grid %}
-        <p class="muted" style="margin:6px 0 0; font-size:12.5px">
-          Fill values for ONE row. The generated plan will instruct the runner to
-          repeat the Add-Row sequence for each additional input row.
-        </p>
-      {% endif %}
       <table class="review-table" style="margin-top:14px">
         <thead>
           <tr>
@@ -285,6 +377,80 @@
   {% endif %}
 {% endfor %}
 </div>{# /#field-blocks #}
+
+<style>
+  table.grid-editor { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.grid-editor th, table.grid-editor td {
+    padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top;
+    text-align: left;
+  }
+  table.grid-editor th { color: var(--muted); font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.4px; }
+  table.grid-editor input, table.grid-editor select {
+    width: 100%; padding: 6px 8px; background: var(--panel-2);
+    color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+    font: inherit; font-size: 12.5px;
+  }
+  button.grid-remove {
+    background: transparent; border: 1px solid var(--border); color: var(--danger);
+    width: 26px; height: 26px; border-radius: 50%; cursor: pointer; padding: 0;
+    line-height: 1;
+  }
+  button.grid-remove:hover { background: rgba(248,113,113,0.1); }
+</style>
+
+<script>
+  // Grid mini-editor: clone the current first row as a blank template; on
+  // submit the server reads grid_<block>_<row_idx>_<field_name> keys.
+  document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('button.grid-add').forEach(btn => {
+      const block = btn.dataset.block;
+      const tbody = document.querySelector(`table.grid-editor[data-block="${block}"] tbody.grid-rows`);
+      btn.addEventListener('click', () => {
+        const idx = tbody.querySelectorAll('tr.grid-row').length;
+        const tpl = tbody.querySelector('tr.grid-row');
+        let tr;
+        if (tpl) {
+          tr = tpl.cloneNode(true);
+          // Reset values and remap row index in name attributes
+          tr.dataset.rowIdx = idx;
+          tr.querySelectorAll('input, select').forEach(el => {
+            el.name = el.name.replace(/(grid_[^_]+(?:_[^_]+)*?_)\d+(_)/, `$1${idx}$2`);
+            // Better: rebuild name from scratch using the block + idx pattern.
+            // The regex above is brittle because block/field can have underscores.
+            // Instead, store the field name in a data-* and rebuild:
+          });
+          // Robust rebuild: derive field name from existing input/select names
+          // by stripping the block+old-index prefix.
+          const cells = tr.querySelectorAll('td input, td select');
+          cells.forEach(el => {
+            // name is grid_<block>_<rowIdx>_<field>; rebuild with new rowIdx.
+            const parts = el.name.split('_');
+            // grid, ...block tokens..., rowIdx, ...field tokens...
+            // Block tokens count = block.split('_').length
+            const blockTokens = block.split('_').length;
+            const head = parts.slice(0, 1 + blockTokens); // ["grid", ...block...]
+            const tail = parts.slice(1 + blockTokens + 1); // skip the old rowIdx
+            el.name = [...head, idx, ...tail].join('_');
+            // Clear value
+            if (el.tagName === 'SELECT') el.selectedIndex = 0;
+            else el.value = '';
+          });
+        } else {
+          // No template row exists — just emit nothing; the block will be
+          // skipped on the server side because no rows = no decisions.
+          return;
+        }
+        tbody.appendChild(tr);
+      });
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!e.target.classList.contains('grid-remove')) return;
+      const tr = e.target.closest('tr.grid-row');
+      if (tr) tr.remove();
+    });
+  });
+</script>
 
 <div class="panel" style="position:sticky; bottom:0; z-index:5;">
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">

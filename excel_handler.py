@@ -44,7 +44,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
 
-SHEET_NAME = "Data"
+SHEET_NAME = "Data"           # legacy name for the master sheet (single-sheet templates)
+MASTER_SHEET_NAME = "Master"  # new name when multi-sheet templates have grids
 
 # Number of data-row cells to pre-format / pre-validate. Excel still applies
 # the validation if the user adds rows beyond this, but pre-applying ensures
@@ -58,23 +59,88 @@ def write_template(
     *,
     placeholder_rows: int = 3,
 ) -> bytes:
-    """Return the XLSX bytes for an empty template. Columns = each decision
-    with mode='excel'. See module docstring for per-type formatting."""
+    """Multi-sheet XLSX template:
+      • Master sheet: master-block fields marked 'from Excel'.
+      • One sheet per editable grid block: the grid's editable fields plus
+        a `MASTER_KEY` column that links each grid row back to a master row.
+        Read-only-only grids (e.g. FST_HIST) are skipped.
+
+    A single-master, no-grid screen still produces a single sheet.
+    """
     excel_decisions = [d for d in decisions if d.get("mode") == "excel"]
-    if not excel_decisions:
-        # Stub workbook — at least the user gets *something*.
+    field_lookup = {(f["block_name"], f["name"]): f for f in screen["fields"]}
+
+    # Identify editable grids that should get their own sheet.
+    blocks = screen.get("blocks") or []
+    editable_grids: list[dict] = []
+    for b in blocks:
+        if not b.get("is_grid"):
+            continue
+        gfields = [f for f in screen["fields"] if f["block_name"] == b["name"]]
+        if not gfields:
+            continue
+        if all(f.get("readonly") for f in gfields):
+            continue  # read-only-only grid → omit from template
+        editable_grids.append(b)
+
+    # Master sheet should only carry non-grid fields. Grid fields are
+    # already covered by their per-grid sheets below; including them on
+    # the master sheet too would confuse users into filling them twice.
+    grid_block_names = {b["name"] for b in editable_grids}
+    master_decisions = [d for d in excel_decisions
+                        if d.get("block_name") not in grid_block_names]
+
+    # Empty case: no master decisions AND no editable grids.
+    if not master_decisions and not editable_grids:
         wb = Workbook()
         ws = wb.active
         ws.title = SHEET_NAME
         ws["A1"] = "No fields marked 'from Excel' yet. Go back to the Review page."
         return _to_bytes(wb)
 
-    field_lookup = {(f["block_name"], f["name"]): f for f in screen["fields"]}
-
     wb = Workbook()
-    ws = wb.active
-    ws.title = SHEET_NAME
+    # The default sheet becomes the master.
+    master_ws = wb.active
+    master_ws.title = MASTER_SHEET_NAME if editable_grids else SHEET_NAME
 
+    if master_decisions:
+        _populate_sheet(master_ws, master_decisions, field_lookup, placeholder_rows)
+    else:
+        master_ws["A1"] = "(No master-block fields are 'from Excel'.)"
+
+    # One sheet per editable grid.
+    for grid in editable_grids:
+        gfields = [f for f in screen["fields"]
+                   if f["block_name"] == grid["name"] and not f.get("readonly")]
+        ws = wb.create_sheet(_safe_sheet_name(grid["name"]))
+        # Synthesize "decisions" for the grid sheet — every editable grid
+        # field becomes a column. Plus a MASTER_KEY column up front.
+        master_key_field = {
+            "block_name": "_meta", "name": "MASTER_KEY",
+            "label": "Master record key",
+            "datatype": "VARCHAR2",
+        }
+        synthetic_decisions = (
+            [{"block_name": "_meta", "field_name": "MASTER_KEY", "mode": "excel", "value": "MASTER_KEY"}]
+            + [{"block_name": grid["name"], "field_name": f["name"], "mode": "excel", "value": f["name"]}
+               for f in gfields]
+        )
+        synthetic_lookup = dict(field_lookup)
+        synthetic_lookup[("_meta", "MASTER_KEY")] = master_key_field
+        _populate_sheet(ws, synthetic_decisions, synthetic_lookup, placeholder_rows,
+                        intro=f"Grid: {grid.get('label') or grid['name']} — "
+                              "MASTER_KEY links each row to the matching master.")
+
+    return _to_bytes(wb)
+
+
+def _populate_sheet(
+    ws,
+    excel_decisions: list[dict],
+    field_lookup: dict,
+    placeholder_rows: int,
+    intro: str | None = None,
+) -> None:
     name_font   = Font(bold=True, color="FFFFFF")
     label_font  = Font(italic=True, color="666666", size=10)
     header_fill = PatternFill("solid", fgColor="2A3142")
@@ -87,54 +153,81 @@ def write_template(
         datatype = (field.get("datatype") or "").upper()
         hint = _format_hint(field, datatype)
 
-        # Row 1: field NAME — this is the key the reader looks up by.
         cell = ws.cell(row=1, column=idx, value=name)
         cell.font = name_font
         cell.fill = header_fill
         cell.alignment = centered
 
-        # Row 2: human cue describing the expected format. Ignored by reader.
         cell = ws.cell(row=2, column=idx, value=hint)
         cell.font = label_font
         cell.alignment = centered
 
-        # Apply per-type formatting & validation to the data rows below.
         _apply_column_format(ws, idx, col_letter, field, datatype)
-
         ws.column_dimensions[col_letter].width = max(len(name), len(hint), 16) + 4
 
-    # Freeze header rows so the user always sees them while scrolling.
     ws.freeze_panes = "A3"
 
-    # Visible-but-blank example rows (formatting/validation already applied).
-    for r in range(3, 3 + placeholder_rows):
-        for c in range(1, len(excel_decisions) + 1):
-            ws.cell(row=r, column=c, value=None)
+    if intro:
+        # Optional intro note above the data rows; doesn't affect parsing
+        # because reader skips row 2 by design.
+        last_col = get_column_letter(len(excel_decisions))
+        ws.merge_cells(f"A{3 + placeholder_rows}:{last_col}{3 + placeholder_rows}")
+        note = ws.cell(row=3 + placeholder_rows, column=1, value=intro)
+        note.font = Font(italic=True, color="888888", size=10)
 
-    return _to_bytes(wb)
+
+def _safe_sheet_name(name: str) -> str:
+    # Excel sheet names: max 31 chars, no `:\\/?*[]`
+    cleaned = "".join("_" if c in r":\/?*[]" else c for c in name)
+    return cleaned[:31] or "Sheet"
 
 
 def read_uploaded(path: Path) -> list[dict[str, Any]]:
-    """Parse a filled XLSX into row dicts keyed by header (field NAME)."""
-    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
-    ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
+    """Parse the master sheet of a filled XLSX into row dicts. Kept for
+    backwards compatibility with single-sheet templates."""
+    return read_uploaded_full(path)["_master"]
 
+
+def read_uploaded_full(path: Path) -> dict[str, list[dict[str, Any]]]:
+    """Parse every sheet. Returns:
+        {"_master": [...master rows], "<grid_block_name>": [...rows], ...}
+
+    Tolerates either a Master-named sheet (multi-sheet template) or a
+    Data-named single sheet (legacy)."""
+    wb = load_workbook(filename=str(path), data_only=True, read_only=True)
+    out: dict[str, list[dict[str, Any]]] = {"_master": []}
+
+    # Pick the master sheet
+    if MASTER_SHEET_NAME in wb.sheetnames:
+        master_ws = wb[MASTER_SHEET_NAME]
+    elif SHEET_NAME in wb.sheetnames:
+        master_ws = wb[SHEET_NAME]
+    else:
+        master_ws = wb.active
+
+    out["_master"] = _read_sheet_rows(master_ws)
+
+    # Every other sheet is a grid sheet — keyed by its title.
+    for sheet_name in wb.sheetnames:
+        if sheet_name in (MASTER_SHEET_NAME, SHEET_NAME):
+            continue
+        out[sheet_name] = _read_sheet_rows(wb[sheet_name])
+    return out
+
+
+def _read_sheet_rows(ws) -> list[dict[str, Any]]:
     headers: list[str] = []
     rows_iter = ws.iter_rows(values_only=True)
-
     try:
         first = next(rows_iter)
     except StopIteration:
         return []
     for cell in first:
         headers.append(str(cell).strip() if cell is not None else "")
-
-    # Skip the "(label)" hint row.
     try:
-        next(rows_iter)
+        next(rows_iter)  # skip the "(label)" hint row
     except StopIteration:
         return []
-
     out: list[dict[str, Any]] = []
     for raw_row in rows_iter:
         row = {h: _coerce(raw_row[i] if i < len(raw_row) else None)
@@ -154,7 +247,11 @@ CHECKBOX_TRUTHY = {"YES", "Y", "TRUE", "1", "TICK", "TICKED", "CHECKED"}
 
 def _format_hint(field: dict, datatype: str) -> str:
     """Human-readable cue printed in row 2 of each column."""
-    label = field.get("label") or field.get("name") or ""
+    name = field.get("name") or ""
+    label = field.get("label") or name
+    if name == "MASTER_KEY":
+        return ("BLANK = apply to every master record. "
+                "Or fill 1/2/3/… to link this row to one specific master.")
     if datatype == "DATE":
         return f"({label}) — date YYYY-MM-DD"
     if datatype == "CHECKBOX":
@@ -190,6 +287,12 @@ def _apply_column_format(
     type. Operates on rows 3..(2 + DATA_ROW_RANGE) — enough that the user
     sees the formatting immediately when they start typing."""
     rng_str = f"{col_letter}3:{col_letter}{2 + DATA_ROW_RANGE}"
+
+    # MASTER_KEY column on grid sheets: integer master-row number.
+    if field.get("name") == "MASTER_KEY":
+        for r in range(3, 3 + DATA_ROW_RANGE):
+            ws.cell(row=r, column=col_idx).number_format = "0"
+        return
 
     # LOV-bound fields are free text. Don't add validation; let the user
     # type the value-to-match.

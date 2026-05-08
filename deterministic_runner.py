@@ -157,7 +157,8 @@ class _Ctx:
         self.cfg = cfg
         self.screenshots_dir = screenshots_dir
         self.recipe = recipe or {}
-        self.screen_frame = None  # set after fast_path step
+        self.screen_frame = None        # FrameLocator pinned by name (set in fast_path)
+        self.screen_iframe_name = None  # the actual `name` attr we pinned to
         self.last_step_title = ""
 
     def screen(self):
@@ -183,9 +184,59 @@ def _do_login(ctx: _Ctx, args: dict) -> str:
     ctx.page.get_by_role(role, name=name).fill(password)
     role, name = fc.LOGIN_SUBMIT_ROLE
     ctx.page.get_by_role(role, name=name).click()
-    # Wait for the post-login chrome to appear before continuing.
     ctx.page.wait_for_load_state("domcontentloaded")
-    return f"signed in as {username}"
+
+    # ---- Handle a session-conflict prompt if it appears ---------------
+    # When the same user already has an active session, FLEXCUBE prompts
+    # for the password again to confirm clearing it. The dialog comes up
+    # in an iframe whose title typically mentions "logged in" / "session"
+    # / "confirm". We try a few common patterns and silently move on if
+    # nothing matches (= no conflict, normal login flow).
+    conflict_msg = _try_resolve_session_conflict(ctx, password)
+    suffix = f"; {conflict_msg}" if conflict_msg else ""
+    return f"signed in as {username}{suffix}"
+
+
+def _try_resolve_session_conflict(ctx: _Ctx, password: str) -> str | None:
+    """Best-effort: if a session-conflict dialog appears, re-enter the
+    password and click OK/Yes/Continue. Returns a description if we acted,
+    None otherwise. Keeps timeouts short so a clean login isn't slowed
+    down by a multi-second wait."""
+    # Title patterns we've seen / expect on FCJNeoWeb. If none match, it's
+    # almost certainly a clean login.
+    title_patterns = [
+        "iframe[title*='Logged In' i]",
+        "iframe[title*='Session' i]",
+        "iframe[title*='Confirm' i]",
+        # Some deployments reuse the generic Information popup for this.
+        "iframe[title='Information Message']",
+    ]
+    for sel in title_patterns:
+        try:
+            ctx.page.wait_for_selector(sel, timeout=1500, state="attached")
+        except Exception:
+            continue
+        try:
+            frame = ctx.page.frame_locator(sel)
+            # Need a visible password field inside the dialog AND a confirm
+            # button — that's the session-conflict shape, not the regular
+            # post-login info popup (which only has an Ok button).
+            pwd = frame.get_by_role("textbox", name="Password")
+            if pwd.count() == 0:
+                continue
+            pwd.fill(password, timeout=2000)
+            for btn_name in ("OK", "Ok", "Yes", "Continue", "Confirm"):
+                try:
+                    frame.get_by_role("button", name=btn_name).click(timeout=1500)
+                    return f"resolved session conflict via {sel} (button: {btn_name})"
+                except Exception:
+                    continue
+            # Couldn't find a confirm button — bail; user (or agent) can
+            # finish manually.
+            return f"session-conflict dialog matched {sel} but no confirm button"
+        except Exception:
+            continue
+    return None
 
 
 def _do_dismiss_info_popup(ctx: _Ctx, args: dict) -> str:
@@ -194,22 +245,45 @@ def _do_dismiss_info_popup(ctx: _Ctx, args: dict) -> str:
     popup = fc.info_popup_frame(parent)
     role, name = fc.INFO_POPUP_OK_ROLE
     popup.get_by_role(role, name=name).click(timeout=10_000)
+
+    # FCJNeoWeb takes ~1–3s to render the workspace toolbar (where Fast
+    # Path lives) after this popup closes. The original successful Claude
+    # Code run masked this with an incidental snapshot+screenshot pair
+    # between the dismiss and the Fast Path action — about 3 seconds of
+    # implicit settling. Without that, the next step's locator can race
+    # the workspace render. Wait for Fast Path itself to appear before
+    # declaring the dismiss done; if it doesn't show up, fall through and
+    # let the next step surface a clearer error.
+    if scope == "page":
+        try:
+            fc.fast_path_locator(ctx.page, timeout_per_attempt_ms=4000)
+        except Exception:
+            pass
     return f"dismissed info popup ({scope})"
 
 
 def _do_fast_path(ctx: _Ctx, args: dict) -> str:
     fid = args["function_id"]
-    role, name = fc.FAST_PATH_ROLE
-    ctx.page.get_by_role(role, name=name).fill(fid)
-    role, name = fc.FAST_PATH_GO_ROLE
-    ctx.page.get_by_role(role, name=name).click()
-    # Give the screen iframe time to mount. We don't have a stable hook so
-    # poll for any iframe whose name attribute looks numeric.
+    fc.fast_path_locator(ctx.page).fill(fid)
+    fc.fast_path_go_locator(ctx.page).click()
     ctx.page.wait_for_selector("iframe[name]:not([name=''])", timeout=30_000)
-    # Brief settle so dynamically-injected content registers.
     ctx.page.wait_for_timeout(800)
-    ctx.screen_frame = fc.screen_frame(ctx.page)
-    return f"opened {fid}"
+
+    # Pin the screen iframe by its actual `name` attribute. If we left the
+    # FrameLocator as `iframe[name]:not(''):visible.last`, every later step
+    # would re-evaluate it — and the moment an LOV popup (which is also a
+    # named iframe) opens, `.last` would return the popup instead of the
+    # screen. Pinning by the discovered name keeps the locator stable for
+    # the whole run.
+    screen_name = fc.discover_screen_iframe_name(ctx.page)
+    if not screen_name:
+        raise RuntimeError(
+            f"Opened {fid} but no named iframe is visible — page may not have "
+            "finished loading the workspace."
+        )
+    ctx.screen_iframe_name = screen_name
+    ctx.screen_frame = fc.screen_frame(ctx.page, name=screen_name)
+    return f"opened {fid} (screen iframe name={screen_name})"
 
 
 def _do_click_screen_action(ctx: _Ctx, args: dict) -> str:
@@ -269,15 +343,348 @@ def _do_select_lov(ctx: _Ctx, args: dict) -> str:
     # 1. Click the LOV button at the right index in the screen frame.
     fc.lov_button_for_field(ctx.screen(), idx).click(timeout=15_000)
 
-    # 2. Wait for the LOV iframe and click Fetch inside it.
+    # 2. LOV popup. Resolve the FrameLocator now so we can type into it.
     popup = fc.lov_popup_frame(ctx.screen(), label, ctx.recipe)
+
+    # 3. Pre-filter: type `row_match` into the popup's first editable text
+    #    input (the standard FCJNeoWeb pattern is a "Code"/"Description"
+    #    filter row at the top of the LOV iframe). Without this, Fetch
+    #    returns just the first page of all records — fine if the LOV has
+    #    a few hundred entries and the target is alphabetically near the
+    #    top, fatal if it isn't. Pre-filtering narrows the result set so
+    #    the target row is guaranteed visible.
+    pre_filter_used = _try_lov_prefilter(popup, label, row_match)
+
+    # 4. Click Fetch. If the input committed an auto-fetch on Tab/Enter
+    #    above, the button might be momentarily disabled — tolerate that
+    #    by short-timing-out and continuing if the table is already
+    #    populated.
     role, name = fc.LOV_FETCH_ROLE
     fetch = popup.get_by_role(role, name=name)
-    fetch.click(timeout=15_000)
+    try:
+        fetch.click(timeout=8_000)
+    except Exception:
+        if not pre_filter_used:
+            raise  # no pre-filter and Fetch failed → genuine error
 
-    # 3. Click the result row matching `row_match`.
+    # 5. Click the result row matching `row_match` (multi-strategy in
+    #    flexcube_selectors.link_by_value).
     fc.link_by_value(popup, row_match).click(timeout=15_000)
-    return f"LOV {label} → {row_match}"
+    suffix = " (pre-filtered)" if pre_filter_used else ""
+    return f"LOV {label} → {row_match}{suffix}"
+
+
+def _try_lov_prefilter(popup, label: str, row_match: str) -> bool:
+    """Type `row_match` into the LOV popup's CODE filter input. The standard
+    FCJNeoWeb LOV layout is a two-column filter row at the top of the popup
+    (Code | Description), so we want to fill the code column — never the
+    description, because that would either narrow nothing useful or reject
+    the value entirely.
+
+    Strategy, in priority order:
+      1. `<Field Label> Code`       — e.g. "Currency Code", "GL Code"
+      2. `<Field Label>`             — when the LOV uses the field label
+                                       directly as the filter accessible
+                                       name (e.g. "Currency", "Asset Code")
+      3. Generic code-y filter names — Code / Id / Number / Reference / etc.
+      4. First visible non-readonly text input that is NOT a Description /
+         Name / Remarks / Address style field. Skipping those keeps us
+         from mis-filtering on long-text columns when the LOV's accessible
+         name is non-obvious.
+
+    Returns True if any strategy succeeded, False otherwise. False is fine —
+    older deployments with no filter row just skip pre-filtering and let
+    Fetch+positional search do the work via `link_by_value`."""
+    label = (label or "").strip()
+    label_candidates: list[str] = []
+    if label:
+        # Common FLEXCUBE pattern: filter accessible name = "<Label> Code".
+        # If the field label already ends in "Code", don't double it up.
+        if not label.lower().endswith("code"):
+            label_candidates.append(f"{label} Code")
+        label_candidates.append(label)
+
+    generic_candidates = (
+        "Code", "Id", "ID", "Number", "Reference", "Reference Number",
+        "Account", "Customer No", "Branch Code",
+    )
+
+    # 1+2: label-driven candidates
+    for fname in label_candidates:
+        try:
+            loc = popup.get_by_role("textbox", name=fname).first
+            loc.wait_for(state="visible", timeout=800)
+            loc.fill(row_match)
+            return True
+        except Exception:
+            continue
+
+    # 3: generic code-y names
+    for fname in generic_candidates:
+        try:
+            loc = popup.get_by_role("textbox", name=fname).first
+            loc.wait_for(state="visible", timeout=600)
+            loc.fill(row_match)
+            return True
+        except Exception:
+            continue
+
+    # 4: structural fallback. Walk visible non-readonly text inputs and
+    #    skip any whose accessible name looks descriptive — those columns
+    #    accept free text but won't filter codes correctly. Prefer inputs
+    #    inside the FIRST row of the filter section (typically the only
+    #    one that holds the code column).
+    descriptive_words = ("description", "name", "remarks", "address",
+                         "narration", "long", "text")
+    try:
+        inputs = popup.locator(
+            'input[type="text"]:not([readonly]):not([disabled])'
+        )
+        count = inputs.count()
+    except Exception:
+        return False
+
+    for i in range(min(count, 6)):  # cap exploration; LOVs rarely have >2 filters
+        candidate = inputs.nth(i)
+        try:
+            candidate.wait_for(state="visible", timeout=800)
+        except Exception:
+            continue
+        try:
+            # Read the input's a11y name (label / aria-label / placeholder)
+            # via the DOM. If it screams "description"-like, skip.
+            name_lc = (candidate.evaluate(
+                "el => (el.getAttribute('aria-label') || el.placeholder || "
+                "el.title || (el.labels && el.labels[0] && el.labels[0].textContent) || '').toLowerCase()"
+            ) or "").strip()
+        except Exception:
+            name_lc = ""
+        if name_lc and any(w in name_lc for w in descriptive_words):
+            continue
+        try:
+            candidate.fill(row_match)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Grid step handlers — for editable multi-row grid blocks
+# ---------------------------------------------------------------------------
+
+def _do_grid_add_row(ctx: _Ctx, args: dict) -> str:
+    fc.grid_add_row_button(ctx.screen()).click(timeout=10_000)
+    # Brief settle so the new row's inputs are mounted before we target them.
+    ctx.page.wait_for_timeout(400)
+    grid = args.get("grid_block_name", "")
+    return f"added new grid row to {grid}".rstrip()
+
+
+def _do_grid_fill_field(ctx: _Ctx, args: dict) -> str:
+    label = args["label"]; value = args["value"]
+    fc.grid_field_in_last_row(ctx.screen(), label).fill(value)
+    return f"grid filled {label} = {value}"
+
+
+def _do_grid_enter_date(ctx: _Ctx, args: dict) -> str:
+    label = args["label"]; value = args["value"]
+    fc.grid_field_in_last_row(ctx.screen(), label).fill(value)
+    return f"grid date {label} = {value}"
+
+
+def _do_grid_select_dropdown(ctx: _Ctx, args: dict) -> str:
+    label = args["label"]; value = args["value"]
+    dropdown = fc.grid_field_in_last_row(ctx.screen(), label, datatype="DROPDOWN")
+    try:
+        dropdown.select_option(value=value)
+    except Exception:
+        dropdown.select_option(label=value)
+    return f"grid selected {label} = {value}"
+
+
+def _do_grid_tick_checkbox(ctx: _Ctx, args: dict) -> str:
+    label = args["label"]
+    # Click the LAST occurrence of the label text — that's the new row's
+    # checkbox. Same label-click strategy as `_do_tick_checkbox`; recipes
+    # can override per checkbox if a deployment needs input-click instead.
+    ctx.screen().get_by_text(label, exact=True).last.click()
+    return f"grid ticked {label}"
+
+
+def _do_grid_select_lov(ctx: _Ctx, args: dict) -> str:
+    label = args["label"]
+    row_match = args["row_match"]
+    # Click the last LOV button — the one in the row we just added.
+    fc.grid_lov_button_last(ctx.screen()).click(timeout=10_000)
+    popup = fc.lov_popup_frame(ctx.screen(), label, ctx.recipe)
+    pre_filter_used = _try_lov_prefilter(popup, label, row_match)
+    role, name = fc.LOV_FETCH_ROLE
+    try:
+        popup.get_by_role(role, name=name).click(timeout=8_000)
+    except Exception:
+        if not pre_filter_used:
+            raise
+    fc.link_by_value(popup, row_match).click(timeout=15_000)
+    suffix = " (pre-filtered)" if pre_filter_used else ""
+    return f"grid LOV {label} → {row_match}{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Replay-from-recording — uses the agent's verified Playwright sequence
+# ---------------------------------------------------------------------------
+
+def _do_replay_step(ctx: _Ctx, args: dict) -> str:
+    """Replay a step's worth of actions captured from a verified Claude
+    Code run (stored as `recipe.step_recordings[<title>]`).
+
+    Substitution rules during replay:
+      • Placeholders ($BASE_URL, $USERNAME, $PASSWORD, $FUNCTION_ID, …)
+        are filled from the current runtime_config.
+      • Per-step data values come from `args.substitutions`: the compiler
+        passes a dict like {"value": "FND001"} for an LOV-select step,
+        and we replace any literal value in the recording that matched
+        the OLD plan's value with the NEW plan's value.
+      • Dynamic frame-name selectors (`iframe[name=":numeric:"]`) are
+        re-bound to the current pinned screen iframe.
+    """
+    title = args.get("step_title", "")
+    actions = args.get("actions") or []
+    subs = args.get("substitutions") or {}
+
+    if not actions:
+        return f"replay {title!r}: no actions"
+
+    n_done = 0
+    for act in actions:
+        op = act.get("op")
+        try:
+            _execute_replay_action(ctx, act, subs)
+            n_done += 1
+        except Exception as exc:
+            raise RuntimeError(
+                f"replay action #{n_done + 1} ({op}) failed in step {title!r}: {exc}"
+            )
+    return f"replayed {n_done} action(s) for {title!r}"
+
+
+def _execute_replay_action(ctx: _Ctx, action: dict, subs: dict) -> None:
+    op = action.get("op")
+    if op == "navigate":
+        url = _sub(action.get("url"), ctx.cfg, subs)
+        ctx.page.goto(url, wait_until="domcontentloaded")
+        return
+
+    # Resolve the frame chain. The leaf is whatever container holds the
+    # locator: either ctx.page (top-level) or some FrameLocator chain.
+    container = _resolve_frame_chain(ctx, action.get("frame_chain") or [])
+
+    locator = _build_locator(container, action.get("locator") or {}, ctx.cfg, subs)
+    if op == "click":
+        locator.click(timeout=15_000)
+    elif op == "fill":
+        value = _sub(action.get("value"), ctx.cfg, subs)
+        locator.fill(value)
+    elif op == "press":
+        key = action.get("key")
+        locator.press(key)
+    elif op == "select_option":
+        value = _sub(action.get("value"), ctx.cfg, subs)
+        try:
+            locator.select_option(value=value)
+        except Exception:
+            locator.select_option(label=value)
+    else:
+        raise RuntimeError(f"unknown replay op: {op!r}")
+
+
+def _resolve_frame_chain(ctx: _Ctx, chain: list[dict]):
+    """Walk a list of frame-hops, returning the FrameLocator (or page)
+    the locator should be evaluated against."""
+    container = ctx.page
+    for hop in chain:
+        sel = hop.get("selector") or ""
+        # Substitute dynamic screen iframe.
+        if 'iframe[name=":numeric:"]' in sel:
+            if not ctx.screen_iframe_name:
+                # Fall back to "last visible named iframe" if we somehow
+                # don't have a pinned name — better than crashing.
+                container = ctx.page.frame_locator(
+                    "iframe[name]:not([name='']):visible"
+                ).last
+                continue
+            sel = sel.replace(':numeric:', ctx.screen_iframe_name)
+        container = container.frame_locator(sel)
+    return container
+
+
+def _build_locator(container, loc: dict, cfg: dict, subs: dict):
+    kind = loc.get("kind")
+    nth = loc.get("nth")
+
+    if kind == "role":
+        role = loc.get("role")
+        name = _sub(loc.get("name"), cfg, subs)
+        if name is not None:
+            base = container.get_by_role(role, name=name, exact=loc.get("exact", False))
+        else:
+            base = container.get_by_role(role)
+    elif kind == "text":
+        text = _sub(loc.get("text") or "", cfg, subs)
+        base = container.get_by_text(text, exact=loc.get("exact", False))
+    elif kind == "placeholder":
+        base = container.get_by_placeholder(loc.get("placeholder") or "")
+    elif kind == "css":
+        base = container.locator(loc.get("selector") or "")
+    else:
+        raise RuntimeError(f"unknown locator kind: {kind!r}")
+
+    # Apply .nth() / .first() / .last() index
+    if nth is None:
+        return base
+    if nth == "first":
+        return base.first
+    if nth == "last":
+        return base.last
+    return base.nth(int(nth))
+
+
+# Map placeholder strings → runtime_config keys (matches the recorder).
+_REPLAY_PLACEHOLDERS = {
+    "$BASE_URL":               "FLEXCUBE_BASE_URL",
+    "$USERNAME":               "FLEXCUBE_USERNAME",
+    "$PASSWORD":               "FLEXCUBE_PASSWORD",
+    "$ACCORDER_AUTH_USERNAME": "FLEXCUBE_ACCORDER_AUTH_USERNAME",
+    "$ACCORDER_AUTH_PASSWORD": "FLEXCUBE_ACCORDER_AUTH_PASSWORD",
+}
+
+
+def _sub(value, cfg: dict, subs: dict) -> str:
+    """Apply placeholder + per-step substitutions. Order:
+       1. Per-step `subs` (e.g. {"value": new_lov_value}) — substituted by
+          replacing any occurrence of the literal old value (= what was
+          recorded) with the new value. This handles cases where the
+          recipe extractor couldn't placeholder a per-step value.
+       2. $-prefixed placeholders → cfg / $FUNCTION_ID.
+    """
+    if value is None:
+        return None
+    s = str(value)
+    # Per-step substitutions (old_value → new_value) — substitutions dict
+    # is keyed by the OLD value text and maps to the new value.
+    for old, new in (subs or {}).items():
+        if old and new is not None:
+            s = s.replace(str(old), str(new))
+    # Placeholder substitution
+    if s.startswith("$"):
+        if s == "$FUNCTION_ID":
+            return subs.get("$FUNCTION_ID") or s
+        env_key = _REPLAY_PLACEHOLDERS.get(s)
+        if env_key:
+            replacement = cfg.get(env_key)
+            if replacement:
+                return replacement
+    return s
 
 
 def _do_screenshot(ctx: _Ctx, args: dict) -> str:
@@ -326,19 +733,31 @@ def _do_todo(ctx: _Ctx, args: dict) -> str:
 
 
 _DISPATCH = {
-    "navigate":            _do_navigate,
-    "login":               _do_login,
-    "dismiss_info_popup":  _do_dismiss_info_popup,
-    "fast_path":           _do_fast_path,
-    "click_screen_action": _do_click_screen_action,
-    "fill_field":          _do_fill_field,
-    "enter_date":          _do_enter_date,
-    "select_dropdown":     _do_select_dropdown,
-    "tick_checkbox":       _do_tick_checkbox,
-    "untick_checkbox":     _do_untick_checkbox,
-    "select_lov":          _do_select_lov,
-    "screenshot":          _do_screenshot,
-    "todo":                _do_todo,
+    "navigate":             _do_navigate,
+    "login":                _do_login,
+    "dismiss_info_popup":   _do_dismiss_info_popup,
+    "fast_path":            _do_fast_path,
+    "click_screen_action":  _do_click_screen_action,
+    "fill_field":           _do_fill_field,
+    "enter_date":           _do_enter_date,
+    "select_dropdown":      _do_select_dropdown,
+    "tick_checkbox":        _do_tick_checkbox,
+    "untick_checkbox":      _do_untick_checkbox,
+    "select_lov":           _do_select_lov,
+    # Grid (multi-row) step handlers — invoked from compiled plans for
+    # editable grid blocks. See plan_compiler._compile_grid_steps.
+    "grid_add_row":         _do_grid_add_row,
+    "grid_fill_field":      _do_grid_fill_field,
+    "grid_enter_date":      _do_grid_enter_date,
+    "grid_select_dropdown": _do_grid_select_dropdown,
+    "grid_tick_checkbox":   _do_grid_tick_checkbox,
+    "grid_select_lov":      _do_grid_select_lov,
+    "screenshot":           _do_screenshot,
+    "todo":                 _do_todo,
+    # Replay-from-recording: walks a captured Playwright sequence with
+    # placeholder + per-step substitutions. Emitted by plan_compiler when
+    # the screen has a verified recipe with step_recordings.
+    "replay_step":          _do_replay_step,
 }
 
 

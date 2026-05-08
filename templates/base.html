@@ -109,6 +109,13 @@
       <nav>
         <a href="{{ url_for('index') }}">Upload</a>
         <a href="{{ url_for('screens_list') }}">History</a>
+        <a href="{{ url_for('settings_view') }}"
+           {% if cfg_ok is defined and not cfg_ok %}
+             style="color: var(--danger);"
+             title="Missing: {{ (cfg_missing or []) | join(', ') }}"
+           {% endif %}>
+          Settings{% if cfg_ok is defined and not cfg_ok %} ⚠{% endif %}
+        </a>
       </nav>
     </header>
 

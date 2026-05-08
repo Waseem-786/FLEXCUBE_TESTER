@@ -112,6 +112,23 @@ CREATE TABLE IF NOT EXISTS runs (
     FOREIGN KEY (screen_id) REFERENCES screens(id)
 );
 
+CREATE TABLE IF NOT EXISTS kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
+-- Multi-row decisions for grid blocks (Create New flow). One row per
+-- (screen_id, block_name); rows_json is a JSON list of dicts, each dict
+-- holding the cell values for one grid row keyed by field NAME. Zero rows
+-- (or empty list) means "skip this grid".
+CREATE TABLE IF NOT EXISTS grid_decisions (
+    screen_id   INTEGER NOT NULL,
+    block_name  TEXT    NOT NULL,
+    rows_json   TEXT    NOT NULL,
+    PRIMARY KEY (screen_id, block_name),
+    FOREIGN KEY (screen_id) REFERENCES screens(id)
+);
+
 CREATE INDEX IF NOT EXISTS ix_blocks_screen          ON blocks(screen_id);
 CREATE INDEX IF NOT EXISTS ix_fields_screen          ON fields(screen_id);
 CREATE INDEX IF NOT EXISTS ix_buttons_screen         ON buttons(screen_id);
@@ -323,7 +340,7 @@ def get_meta_yaml(db_path: str | Path, screen_id: int) -> str | None:
 def delete_screen(db_path: str | Path, screen_id: int) -> None:
     with _connect(db_path) as conn:
         for table in ("blocks", "fields", "buttons", "dependencies", "validations",
-                      "field_decisions", "runs"):
+                      "field_decisions", "grid_decisions", "runs"):
             conn.execute(f"DELETE FROM {table} WHERE screen_id = ?", (screen_id,))
         conn.execute("DELETE FROM screens WHERE id = ?", (screen_id,))
 
@@ -515,6 +532,77 @@ def save_excel_upload(
              datetime.utcnow().isoformat(timespec="seconds") + "Z",
              row_count, screen_id),
         )
+
+
+# ---------------------------------------------------------------------------
+# Grid-block decisions (multi-row, Create New flow)
+# ---------------------------------------------------------------------------
+
+def save_grid_decisions(
+    db_path: str | Path,
+    screen_id: int,
+    grids: dict[str, list[dict]],
+) -> None:
+    """Replace any prior grid-row data for this screen. `grids` maps
+    block_name → list of row dicts (each row dict keyed by field NAME).
+    Empty values lists are persisted (means "no rows entered for this grid")."""
+    import json as _json
+    with _connect(db_path) as conn:
+        conn.execute("DELETE FROM grid_decisions WHERE screen_id = ?", (screen_id,))
+        for block_name, rows in grids.items():
+            conn.execute(
+                """INSERT INTO grid_decisions (screen_id, block_name, rows_json)
+                   VALUES (?, ?, ?)""",
+                (screen_id, block_name, _json.dumps(rows)),
+            )
+
+
+def get_grid_decisions(db_path: str | Path, screen_id: int) -> dict[str, list[dict]]:
+    """Return {block_name: [rows]}. Empty dict if nothing saved yet."""
+    import json as _json
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT block_name, rows_json FROM grid_decisions WHERE screen_id = ?",
+            (screen_id,),
+        ).fetchall()
+        out: dict[str, list[dict]] = {}
+        for r in rows:
+            try:
+                out[r["block_name"]] = _json.loads(r["rows_json"]) or []
+            except Exception:
+                out[r["block_name"]] = []
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Project settings (key-value store)
+# ---------------------------------------------------------------------------
+
+def get_setting(db_path: str | Path, key: str) -> str | None:
+    with _connect(db_path) as conn:
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def get_all_settings(db_path: str | Path) -> dict[str, str]:
+    with _connect(db_path) as conn:
+        return {r["key"]: r["value"]
+                for r in conn.execute("SELECT key, value FROM kv").fetchall()}
+
+
+def set_settings(db_path: str | Path, items: dict[str, str | None]) -> None:
+    """Bulk-update the kv table. Keys with `None` value are deleted; empty
+    strings are also treated as 'unset' so the user can clear a field."""
+    with _connect(db_path) as conn:
+        for k, v in items.items():
+            if v is None or v == "":
+                conn.execute("DELETE FROM kv WHERE key = ?", (k,))
+            else:
+                conn.execute(
+                    """INSERT INTO kv (key, value) VALUES (?, ?)
+                       ON CONFLICT (key) DO UPDATE SET value = excluded.value""",
+                    (k, v),
+                )
 
 
 def clear_excel_upload(db_path: str | Path, screen_id: int) -> None:

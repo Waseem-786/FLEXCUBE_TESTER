@@ -42,7 +42,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from db import create_run, set_run_kind, update_run, get_recipe
+from db import create_run, set_run_kind, update_run, get_recipe, get_grid_decisions
 from plan_compiler import compile_plan
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -105,13 +105,35 @@ def load_dotenv(path: Path = DOTENV_PATH) -> dict[str, str]:
     return env
 
 
-def runtime_config() -> dict[str, str | None]:
-    """Merge .env onto os.environ. .env wins. Process env is a useful fallback
-    when the user starts Flask after `set BASE_URL=...` in their shell."""
+def runtime_config(db_path: Path | None = None) -> dict[str, str | None]:
+    """Resolve every FLEXCUBE_ runtime setting in priority order:
+
+      1. The Settings page (kv rows in screens.db).  ← canonical source
+      2. The `.env` file at the project root.        ← legacy fallback
+      3. os.environ.                                  ← last resort
+
+    Most callers want path #1, but the function accepts an optional
+    `db_path` so it can also be invoked from contexts that don't have
+    Flask's `DB_PATH` in scope. When `db_path` is None, falls back to
+    the project-root default.
+    """
+    db_settings: dict[str, str] = {}
+    target_db = db_path or (PROJECT_ROOT / "screens.db")
+    if target_db.exists():
+        try:
+            from db import get_all_settings
+            db_settings = get_all_settings(target_db) or {}
+        except Exception:
+            db_settings = {}
+
     file_env = load_dotenv()
     out: dict[str, str | None] = {}
     for k in REQUIRED_ENV + OPTIONAL_ENV:
-        out[k] = file_env.get(k) or os.environ.get(k)
+        out[k] = (
+            db_settings.get(k)
+            or file_env.get(k)
+            or os.environ.get(k)
+        )
     return out
 
 
@@ -191,6 +213,12 @@ Hard rules — these are non-negotiable:
    "Authorize Record (second user)" step — that requires a different login
    session and is handled by a follow-up run.
 
+3a. If logging in surfaces a "user already logged in" / session-conflict
+   dialog (FLEXCUBE asks for the password again to clear the previous
+   session), re-enter the same password and click OK / Continue / Yes.
+   Don't abandon the run on this — it's expected when the same user has
+   another active session. After the dialog clears, proceed normally.
+
 4. If any action fails (timeout, element not found, FLEXCUBE validation
    error, unexpected popup not described in the plan), STOP, take a
    screenshot named `error_<step-number>.png`, and emit a brief explanation
@@ -268,6 +296,18 @@ def start_run(
     for k, v in cfg.items():
         if v is not None:
             env[k] = v
+
+    # Force synchronous MCP-server connection. Without this, Claude Code
+    # 2.1.116+ runs --mcp-config servers fully async (it logs
+    # `[MCP] --mcp-config servers running fully async (MCP_CONNECTION_NONBLOCKING)`
+    # at startup) and finalises the agent's tool list BEFORE the playwright
+    # server has registered its tools — so the agent stops with "no MCP
+    # tools available" even though the server connects fine ~3 seconds
+    # later. We diagnosed this from a debug log showing the server
+    # successfully connecting AFTER the agent's response. Setting the env
+    # var to "false" makes startup wait for MCP servers to register before
+    # exposing the toolset to the agent.
+    env["MCP_CONNECTION_NONBLOCKING"] = "false"
 
     # Open log file in binary append; subprocess writes raw bytes here.
     log_fp = log_path.open("wb")
@@ -362,24 +402,46 @@ def start_run_deterministic(
     screenshots_dir = run_dir / "screenshots"
     screenshots_dir.mkdir(parents=True, exist_ok=True)
 
-    # For bulk_load we need the parsed Excel rows up front so the compiler
-    # can pre-expand per-row steps.
+    # Load grid-row decisions from the DB (Create New) or read multi-sheet
+    # Excel (Bulk Load) so the compiler can emit real Add-Row + fill steps
+    # instead of a TODO stub.
     excel_rows = None
+    excel_grid_rows: dict[str, list[dict]] = {}
+    grid_rows = get_grid_decisions(db_path, screen_id) or {}
+
     if workflow_mode == "bulk_load":
         excel_path = screen.get("excel_path")
         if not excel_path:
             return (0, "Bulk Load needs an uploaded Excel file. Upload one on the Review page first.")
-        from excel_handler import read_uploaded
+        from excel_handler import read_uploaded_full
         try:
-            excel_rows = read_uploaded(PROJECT_ROOT / excel_path)
+            full = read_uploaded_full(PROJECT_ROOT / excel_path)
         except Exception as exc:
             return (0, f"failed to read Excel file: {exc}")
+        excel_rows = full.get("_master") or []
         if not excel_rows:
-            return (0, "The uploaded Excel file has no data rows.")
+            return (0, "The uploaded Excel file's master sheet has no data rows.")
+        for sheet_name, rows in full.items():
+            if sheet_name == "_master":
+                continue
+            excel_grid_rows[sheet_name] = rows
+
+    # Load the verified recipe (if any) BEFORE compiling so the compiler
+    # can swap typed step groups for `replay_step` actions where the
+    # recording covers them. The same recipe is also persisted next to
+    # the plan so the runner subprocess can read selector overrides from
+    # disk (checkbox_strategy / lov_popup_titles / etc.).
+    recipe = get_recipe(db_path, screen_id)
 
     # Compile the plan and persist it next to the log/screenshots.
     try:
-        plan = compile_plan(screen, workflow_mode, decisions, excel_rows=excel_rows)
+        plan = compile_plan(
+            screen, workflow_mode, decisions,
+            excel_rows=excel_rows,
+            grid_rows=grid_rows,
+            excel_grid_rows=excel_grid_rows,
+            recipe=recipe,
+        )
     except Exception as exc:
         return (0, f"plan compilation failed: {exc}")
     plan_path = run_dir / "plan.json"
@@ -394,9 +456,6 @@ def start_run_deterministic(
         screenshots_dir=str(screenshots_dir.relative_to(PROJECT_ROOT).as_posix()),
     )
 
-    # If this screen is verified, persist its recipe alongside the plan so
-    # the runner subprocess can read selector overrides from disk.
-    recipe = get_recipe(db_path, screen_id)
     recipe_path = run_dir / "recipe.json"
     if recipe is not None:
         recipe_path.write_text(json.dumps(recipe, indent=2), encoding="utf-8")

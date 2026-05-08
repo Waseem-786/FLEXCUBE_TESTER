@@ -30,15 +30,21 @@ from flask import (
 import runner
 from claude_md_generator import (
     WORKFLOW_MODES, generate_claude_md, parse_decisions_from_form,
+    parse_grid_decisions_from_form,
 )
 from db import (
-    clear_excel_upload, create_run, delete_screen, get_claude_md,
-    get_eligible_verify_run, get_field_decisions, get_meta_yaml, get_recipe,
-    get_run, get_screen, init_db, list_runs, list_screens, mark_verified,
-    save_excel_upload, save_field_decisions, save_screen, unmark_verified,
-    update_run,
+    clear_excel_upload, create_run, delete_screen, get_all_settings,
+    get_claude_md, get_eligible_verify_run, get_field_decisions,
+    get_grid_decisions, get_meta_yaml, get_recipe, get_run, get_screen,
+    init_db, list_runs, list_screens, mark_verified, save_excel_upload,
+    save_field_decisions, save_grid_decisions, save_screen, set_settings,
+    unmark_verified, update_run,
 )
-from excel_handler import read_uploaded as read_uploaded_excel, write_template
+from excel_handler import (
+    read_uploaded as read_uploaded_excel,
+    read_uploaded_full as read_uploaded_excel_full,
+    write_template,
+)
 from recipe_extractor import extract_recipe_from_log
 from flexcube_js_parser import FlexcubeJSParser
 from flexcube_uixml_parser import FlexcubeUIXMLParser
@@ -180,6 +186,47 @@ def screen_verify(screen_id: int):
 UPLOADS_DIR = BASE_DIR / "uploads"
 
 
+# Settings-related keys are the same names runtime_config uses internally.
+SETTING_KEYS_REQUIRED = ["FLEXCUBE_BASE_URL", "FLEXCUBE_USERNAME", "FLEXCUBE_PASSWORD"]
+SETTING_KEYS_OPTIONAL = ["FLEXCUBE_ACCORDER_AUTH_USERNAME", "FLEXCUBE_ACCORDER_AUTH_PASSWORD"]
+
+
+@app.context_processor
+def inject_runtime_config_status():
+    """Make `cfg_ok` and `cfg_missing` available in every template so
+    base.html can render the 'Configure credentials' nav prompt and any
+    page can detect missing config without re-querying."""
+    ok, missing = runner.runtime_config_status()
+    return {"cfg_ok": ok, "cfg_missing": missing}
+
+
+@app.get("/settings")
+def settings_view():
+    saved = get_all_settings(DB_PATH)
+    # Surface the legacy-fallback values so the user can see what would be
+    # used if they leave a field blank. Don't surface the actual values
+    # though — that'd leak .env passwords back into the rendered HTML.
+    return render_template(
+        "settings.html",
+        saved=saved,
+        required_keys=SETTING_KEYS_REQUIRED,
+        optional_keys=SETTING_KEYS_OPTIONAL,
+    )
+
+
+@app.post("/settings")
+def settings_save():
+    keys = SETTING_KEYS_REQUIRED + SETTING_KEYS_OPTIONAL
+    updates: dict[str, str | None] = {}
+    for k in keys:
+        v = (request.form.get(k) or "").strip()
+        # Empty string in the form means "unset / use legacy fallback if any".
+        updates[k] = v or None
+    set_settings(DB_PATH, updates)
+    flash("Settings saved.", "success")
+    return redirect(url_for("settings_view"))
+
+
 def _bulk_load_decisions(screen: dict) -> list[dict]:
     """Auto-derive 'from Excel' decisions for every non-readonly field.
     Bulk mode is meant to be zero-config — the user picks bulk_load,
@@ -274,10 +321,12 @@ def screen_review(screen_id: int):
     if not screen:
         abort(404)
     prior = get_field_decisions(DB_PATH, screen_id)
+    prior_grids = get_grid_decisions(DB_PATH, screen_id)
     return render_template(
         "review.html",
         screen=screen,
         prior_decisions=prior,
+        prior_grid_decisions=prior_grids,
         workflow_modes=WORKFLOW_MODES,
         active_mode=screen.get("workflow_mode") or "create_new",
     )
@@ -300,31 +349,45 @@ def screen_generate(screen_id: int):
         # Bulk mode is zero-config on the frontend — every non-readonly
         # field is automatically a column in the Excel template.
         decisions = _bulk_load_decisions(screen)
+        grid_rows: dict[str, list[dict]] = {}
     else:
         decisions = parse_decisions_from_form(screen["fields"], request.form)
+        grid_rows = parse_grid_decisions_from_form(
+            screen["blocks"], screen["fields"], request.form,
+        )
 
-    # For bulk_load: read the persisted Excel file so the composer can
-    # pre-expand per-row steps. Generate-without-upload still works (you
-    # get a TODO-stubbed plan), but it's a nudge to upload first.
     excel_rows = None
+    excel_grid_rows: dict[str, list[dict]] = {}
     if workflow_mode == "bulk_load":
         excel_path_rel = screen.get("excel_path")
         if excel_path_rel:
             abs_path = BASE_DIR / excel_path_rel
             try:
-                excel_rows = read_uploaded_excel(abs_path)
+                full = read_uploaded_excel_full(abs_path)
+                excel_rows = full.get("_master") or []
+                # Map each grid sheet (by sheet title = block name) into the
+                # excel_grid_rows dict the bulk composer consumes.
+                for sheet_name, rows in full.items():
+                    if sheet_name == "_master":
+                        continue
+                    excel_grid_rows[sheet_name] = rows
             except Exception as exc:
                 flash(f"Failed to read Excel file: {exc}", "error")
                 return redirect(url_for("screen_review", screen_id=screen_id))
 
     try:
-        claude_md = generate_claude_md(screen, workflow_mode, decisions,
-                                       excel_rows=excel_rows)
+        claude_md = generate_claude_md(
+            screen, workflow_mode, decisions,
+            excel_rows=excel_rows,
+            grid_rows=grid_rows,
+            excel_grid_rows=excel_grid_rows,
+        )
     except Exception as exc:
         flash(f"Failed to generate plan: {exc}", "error")
         return redirect(url_for("screen_review", screen_id=screen_id))
 
     save_field_decisions(DB_PATH, screen_id, decisions, workflow_mode, claude_md)
+    save_grid_decisions(DB_PATH, screen_id, grid_rows)
 
     used = sum(1 for d in decisions if d["mode"] != "skip")
     flash(f"Generated CLAUDE.md from {used} field decisions.", "success")
