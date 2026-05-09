@@ -246,16 +246,22 @@ def dropdown_select(frame: "FrameLocator", label: str) -> "Locator":
 
 
 def grid_add_row_button(frame: "FrameLocator",
+                        grid_index: int | None = None,
                         timeout_per_attempt_ms: int = 5000) -> "Locator":
-    """Find the + (Add Row) button for a grid. FCJNeoWeb deployments vary —
-    a literal `+` text button, "Add" labelled button, or an icon-only
-    button/link with title="Add"/aria-label="Add". Tries strategies in
-    priority order; we use `.last` because:
-      • Most screens have a single editable grid (so .last == .first).
-      • Multi-grid screens emit one button per grid; the LAST one is
-        usually the most recently rendered, matching typical grid
-        ordering. If a future screen needs a different one, recipes can
-        override.
+    """Find the + (Add Row) button for a grid.
+
+    On screens with **multiple editable grids** (e.g. IADADHPL has both
+    an Asset grid and a Borrower / Liability grid), every grid has its
+    own visually-identical `+` button. Without a positional hint we'd
+    just pick `.last` and consistently click the wrong grid's button.
+
+    Pass `grid_index` (0-based among editable grids in UIXML / DOM order)
+    so the selector targets `.nth(grid_index)` on the resolved candidate
+    set. When `grid_index` is None we fall back to `.last` — fine for
+    single-grid screens.
+
+    Strategies tried in priority order: `<button>` named +, "Add Row",
+    "Add", then CSS / aria-label variants for `<a>` and icon-only buttons.
     """
     candidates = [
         frame.get_by_role("button", name="+"),
@@ -270,14 +276,16 @@ def grid_add_row_button(frame: "FrameLocator",
     ]
     last_err: Exception | None = None
     for loc in candidates:
+        target = loc.nth(grid_index) if isinstance(grid_index, int) else loc.last
         try:
-            loc.last.wait_for(state="visible", timeout=timeout_per_attempt_ms)
-            return loc.last
+            target.wait_for(state="visible", timeout=timeout_per_attempt_ms)
+            return target
         except Exception as exc:
             last_err = exc
     raise RuntimeError(
         f"Grid Add Row button not found by any known strategy "
-        f"(button: +, Add Row, Add; same as link/aria-label). Last error: {last_err}"
+        f"(grid_index={grid_index!r}; tried button: +, Add Row, Add; "
+        f"same as link/aria-label). Last error: {last_err}"
     )
 
 
@@ -291,6 +299,86 @@ def grid_field_in_last_row(frame: "FrameLocator", label: str,
     return frame.get_by_role("textbox", name=label).last
 
 
+def grid_cell_focus(frame: "FrameLocator", page, label: str,
+                    timeout_per_attempt_ms: int = 2500) -> "Locator":
+    """Mount + focus a grid cell's lazy `<input>` and return it.
+
+    Why this is needed: FCJNeoWeb grids render cells as styled `<td>` text
+    by default. The editable `<input>` is mounted *only* while the cell
+    has focus, and unmounted on blur. So:
+      - `getByRole('textbox', name=label)` doesn't match — the input
+        isn't in the DOM yet.
+      - `getByRole('cell', name=label)` doesn't match either — the ARIA
+        name of a cell is its *content* (empty for unfilled cells), not
+        the column header.
+      - `getByText(label)` matches the column header `<th>` text.
+        Clicking the header does NOT mount the row's input.
+
+    Reliable approach: locate the column **header** (which DOES carry the
+    label as accessible name) to get its X bounds, then click in the last
+    row's Y band at that X. That precisely hits the visible cell area
+    and triggers FCJNeoWeb to mount + focus the input.
+
+    Returns the now-mounted input Locator. Callers can `.fill()` it or
+    `keyboard.type()` after — both work once the input is in the DOM.
+    """
+    input_loc = frame.get_by_role("textbox", name=label).last
+
+    # Path 1: already mounted (e.g. auto-focused right after grid_add_row,
+    # or focus arrived here by Tab from the previous cell). Just click to
+    # be sure focus is on it, then return.
+    try:
+        input_loc.wait_for(state="visible", timeout=600)
+        input_loc.click(timeout=1000)
+        return input_loc
+    except Exception:
+        pass
+
+    # Path 2: header X × last-row Y click. Try several header selectors
+    # in priority order; first one whose box we can resolve wins.
+    header_candidates = [
+        frame.get_by_role("columnheader", name=label).last,
+        frame.locator("th").filter(has_text=label).last,
+        frame.get_by_text(label, exact=True).first,
+    ]
+    last_err: Exception | None = None
+    for header in header_candidates:
+        try:
+            header.wait_for(state="visible", timeout=timeout_per_attempt_ms)
+            header_box = header.bounding_box(timeout=1000)
+            if not header_box:
+                continue
+            # Find the table containing this header, then its last data row.
+            table = frame.locator("table").filter(has=header).last
+            last_row = table.locator("tbody tr").last
+            try:
+                last_row.wait_for(state="visible", timeout=800)
+            except Exception:
+                # Fallback: any tr in the table (some grids skip tbody)
+                last_row = table.locator("tr").last
+                last_row.wait_for(state="visible", timeout=800)
+            row_box = last_row.bounding_box(timeout=1000)
+            if not row_box:
+                continue
+            # Click viewport-relative; bounding_box is iframe-aware.
+            page.mouse.click(
+                header_box["x"] + header_box["width"] / 2,
+                row_box["y"] + row_box["height"] / 2,
+            )
+            # Now wait for the textbox to actually appear in DOM.
+            input_loc.wait_for(state="visible", timeout=timeout_per_attempt_ms)
+            return input_loc
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    raise RuntimeError(
+        f"Grid cell {label!r} could not be focused for editing. Tried "
+        f"already-mounted input, then column-header X × last-row Y click. "
+        f"Last error: {last_err}"
+    )
+
+
 def grid_lov_button_last(frame: "FrameLocator") -> "Locator":
     """LOV button in the most recently added grid row. Selects the last
     visible "List of Values" button on the screen — works because grids
@@ -298,6 +386,35 @@ def grid_lov_button_last(frame: "FrameLocator") -> "Locator":
     button is the latest one in the DOM."""
     role, name = LOV_BUTTON_ROLE
     return frame.get_by_role(role, name=name).last
+
+
+def screen_button(frame: "FrameLocator", label: str,
+                  timeout_per_attempt_ms: int = 4000) -> "Locator":
+    """Resolve a custom in-screen action button (Submit / Calculation / etc.)
+    by visible label. Multi-strategy because FCJNeoWeb renders these as
+    `<button>` in some screens and `<a>` (link) elsewhere; some deployments
+    expose only the input or a styled span. Falls back to clickable text
+    last so the failure message still names the locator. Per-screen recipe
+    overrides aren't needed here — the label IS the public surface."""
+    candidates = [
+        frame.get_by_role("button", name=label, exact=True),
+        frame.get_by_role("button", name=label),
+        frame.get_by_role("link",   name=label, exact=True),
+        frame.locator(f'input[type="button"][value="{label}"]'),
+        frame.locator(f'input[type="submit"][value="{label}"]'),
+        frame.get_by_text(label, exact=True),
+    ]
+    last_err: Exception | None = None
+    for loc in candidates:
+        try:
+            loc.first.wait_for(state="visible", timeout=timeout_per_attempt_ms)
+            return loc.first
+        except Exception as exc:
+            last_err = exc
+    raise RuntimeError(
+        f"In-screen button {label!r} not found by any known strategy "
+        f"(button / link / input by name '{label}'). Last error: {last_err}"
+    )
 
 
 def link_by_value(frame: "FrameLocator", value: str,

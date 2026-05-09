@@ -4,6 +4,11 @@
 {% macro field_row(field) %}
 {% set key = field.block_name ~ "__" ~ field.name %}
 {% set prior = prior_decisions.get((field.block_name, field.name)) %}
+{# When the prior decision was a bulk-load 'excel' pick, its `value` is the
+   Excel COLUMN name (defaults to the field NAME), which would pollute the
+   Create-New value input with text like "ASSETCODE". Strip it here so
+   Create-New only ever shows real human-typed values. #}
+{% set prior_value = '' if prior and prior.mode == 'excel' else (prior.value if prior else '') %}
 {% set datatype = (field.datatype or '')|upper %}
 {% set is_grid = field.is_grid_column %}
 {% set is_required = field.required %}
@@ -80,17 +85,17 @@
     {% elif is_lov %}
       <input type="text" name="value_{{ key }}" form="form-generate"
              placeholder="row-matching value (e.g. USD)"
-             value="{{ (prior.value if prior else '') or '' }}">
+             value="{{ prior_value }}">
     {% elif is_date %}
       <input type="date" name="value_{{ key }}" form="form-generate"
-             value="{{ (prior.value if prior else '') or '' }}">
+             value="{{ prior_value }}">
     {% elif is_number %}
       <input type="number" name="value_{{ key }}" step="any" form="form-generate"
-             value="{{ (prior.value if prior else '') or '' }}">
+             value="{{ prior_value }}">
     {% else %}
       <input type="text" name="value_{{ key }}" form="form-generate"
              {% if field.length %}maxlength="{{ field.length }}"{% endif %}
-             value="{{ (prior.value if prior else '') or '' }}">
+             value="{{ prior_value }}">
     {% endif %}
   </td>
 </tr>
@@ -103,7 +108,11 @@
       <h2 style="margin:0 0 6px">Review fields — {{ screen.name }}</h2>
       <div class="meta-row">
         <span><span class="k">Function ID</span> <span class="v">{{ screen.function_id }}</span></span>
-        <span><span class="k">Fields</span> <span class="v">{{ screen.fields|length }}</span></span>
+        <span><span class="k">Fields</span>
+          <span class="v">{{ screen.fields | rejectattr('readonly') | list | length }}</span>
+          {% set ro = screen.fields | selectattr('readonly') | list | length %}
+          {% if ro %}<span class="muted" style="font-size:12.5px">+ {{ ro }} read-only auto-populated</span>{% endif %}
+        </span>
         <span><span class="k">Blocks</span> <span class="v">{{ screen.blocks|length }}</span></span>
       </div>
     </div>
@@ -258,7 +267,9 @@
         <div style="display:flex; justify-content:space-between; align-items:baseline;">
           <h3 style="margin:0">
             {{ block.label or block.name }}
-            <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span>
+            {% if block.label and block.label != block.name %}
+              <span class="muted mono" style="font-size:12.5px">{{ block.name }}</span>
+            {% endif %}
           </h3>
           <div>
             <span class="pill">grid · multi-row</span>
@@ -342,40 +353,113 @@
          knows it's intentionally absent, no input box. #}
       <div class="panel" style="opacity:0.7">
         <h3 style="margin:0">{{ block.label or block.name }}
-          <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span></h3>
+          {% if block.label and block.label != block.name %}
+            <span class="muted mono" style="font-size:12.5px">{{ block.name }}</span>
+          {% endif %}</h3>
         <p class="muted" style="margin:6px 0 0; font-size:12.5px">
           Read-only grid — auto-populated by FLEXCUBE. No input needed; this block is omitted from the plan.
         </p>
       </div>
     {% endif %}
   {% else %}
-    <div class="panel">
-      <div style="display:flex; justify-content:space-between; align-items:baseline;">
-        <h3 style="margin:0">
-          {{ block.label or block.name }}
-          <span class="muted mono" style="font-size:12.5px">({{ block.name }})</span>
-        </h3>
-        <span class="muted" style="font-size:12.5px">{{ block_fields|length }} fields</span>
+    {# Read-only fields are auto-populated by FLEXCUBE — they have no place
+       in the review form. Drop them entirely so the block isn't padded
+       with disabled rows the user can't act on. If everything in the
+       block is read-only, skip the block too. #}
+    {% set editable_fields = block_fields | rejectattr('readonly') | list %}
+    {% if editable_fields %}
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:baseline;">
+          <h3 style="margin:0">
+            {{ block.label or block.name }}
+            {% if block.label and block.label != block.name %}
+              <span class="muted mono" style="font-size:12.5px">{{ block.name }}</span>
+            {% endif %}
+          </h3>
+          <span class="muted" style="font-size:12.5px">{{ editable_fields|length }} field{{ 's' if editable_fields|length != 1 }}</span>
+        </div>
+        <table class="review-table" style="margin-top:14px">
+          <thead>
+            <tr>
+              <th style="width:18%">Name</th>
+              <th style="width:22%">Label</th>
+              <th style="width:14%">Type</th>
+              <th style="width:18%">Action</th>
+              <th>Value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for f in editable_fields %}
+              {{ field_row(f) }}
+            {% endfor %}
+          </tbody>
+        </table>
       </div>
-      <table class="review-table" style="margin-top:14px">
-        <thead>
-          <tr>
-            <th style="width:18%">Name</th>
-            <th style="width:22%">Label</th>
-            <th style="width:14%">Type</th>
-            <th style="width:18%">Action</th>
-            <th>Value</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for f in block_fields %}
-            {{ field_row(f) }}
-          {% endfor %}
-        </tbody>
-      </table>
-    </div>
+    {% endif %}
   {% endif %}
 {% endfor %}
+
+{# In-screen action buttons declared on the screen (Submit, Calculation,
+   etc.) — anything outside the standard FLEXCUBE toolbar. Each gets a
+   yes/no checkbox so the user can opt in to clicking it as part of the
+   plan. Hidden if the screen has no custom buttons. #}
+{% set custom_buttons = (screen.buttons or []) | selectattr('is_custom') | list %}
+{% if custom_buttons %}
+  <div class="panel">
+    <h3 style="margin-top:0">In-screen actions</h3>
+    <p class="muted" style="margin:0 0 14px; font-size:12.5px">
+      Tick any custom buttons the test should click after filling fields and
+      before Save. Standard toolbar actions (New / Save / Authorize / etc.)
+      are always part of the plan and don't appear here.
+    </p>
+    <div class="button-grid">
+      {% for btn in custom_buttons %}
+        {% set checked = (prior_button_decisions or {}).get(btn.name, False) %}
+        <label class="button-toggle">
+          <input type="checkbox"
+                 form="form-generate"
+                 name="button_{{ btn.name }}"
+                 value="1"
+                 {% if checked %}checked{% endif %}>
+          <div class="button-toggle-body">
+            <div class="button-toggle-label">
+              {{ btn.label or btn.name }}
+            </div>
+            <div class="mono muted" style="font-size:11.5px;">
+              {{ btn.name }}
+              {% if btn.parent_block %}· {{ btn.parent_block }}{% endif %}
+            </div>
+          </div>
+        </label>
+      {% endfor %}
+    </div>
+  </div>
+
+  <style>
+    .button-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 10px;
+    }
+    .button-toggle {
+      display: flex; align-items: flex-start; gap: 12px;
+      padding: 12px 14px; margin: 0;
+      border: 1px solid var(--border); border-radius: var(--r-md);
+      background: var(--panel-2); cursor: pointer;
+      transition: border-color var(--t-fast) var(--ease),
+                  background-color var(--t-fast) var(--ease);
+    }
+    .button-toggle:hover { border-color: var(--border-strong); background: var(--panel-hover); }
+    .button-toggle:has(input:checked) {
+      border-color: var(--accent); background: var(--accent-soft);
+      box-shadow: var(--shadow-glow);
+    }
+    .button-toggle input[type="checkbox"] {
+      width: 16px; height: 16px; margin: 2px 0 0 0; flex: none;
+      accent-color: var(--accent);
+    }
+    .button-toggle-label { font-weight: 500; font-size: 13.5px; margin-bottom: 2px; }
+  </style>
+{% endif %}
 </div>{# /#field-blocks #}
 
 <style>
@@ -452,9 +536,9 @@
   });
 </script>
 
-<div class="panel" style="position:sticky; bottom:0; z-index:5;">
+<div class="panel sticky-actions">
   <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-    <button type="submit" form="form-generate">Generate CLAUDE.md</button>
+    <button type="submit" form="form-generate">Generate plan →</button>
     <a href="{{ url_for('screen_detail', screen_id=screen.id) }}" class="btn ghost">Cancel</a>
     <span class="muted" style="font-size:12.5px">
       Required fields cannot be skipped. Read-only fields are auto-populated by FLEXCUBE.
@@ -463,6 +547,19 @@
 </div>
 
 <style>
+  /* Sticky action bar pinned to viewport bottom while the user fills
+     the form. The panel's own border/background comes from .panel. */
+  .sticky-actions {
+    position: sticky;
+    bottom: 16px;
+    z-index: 5;
+    box-shadow: 0 -8px 24px rgba(0,0,0,0.35);
+  }
+  /* The action bar floats at the bottom of the viewport, so without
+     extra room the last form block ends up underneath it. Reserve a
+     scroll buffer on the page so users can always scroll the bottom-
+     most field into view above the bar. */
+  body { padding-bottom: 120px; }
   .review-table { width: 100%; border-collapse: collapse; }
   .review-table th, .review-table td {
     padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top;

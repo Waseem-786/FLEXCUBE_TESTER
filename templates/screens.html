@@ -3,16 +3,32 @@
 
 {% block content %}
 <div class="panel">
-  <h2 style="margin-top:0">Saved screens</h2>
+  <div style="display:flex; align-items:baseline; justify-content:space-between; gap:16px; margin-bottom:6px;">
+    <h2 style="margin:0">Saved screens</h2>
+    {% if screens %}
+      <span class="muted" style="font-size:12.5px">{{ screens|length }} screen{{ 's' if screens|length != 1 }}</span>
+    {% endif %}
+  </div>
 
   {% if not screens %}
-    <p class="muted">No screens uploaded yet. <a href="{{ url_for('index') }}">Upload one</a>.</p>
+    {# Empty state — friendly, not silent. #}
+    <div style="text-align:center; padding:48px 16px;">
+      <div style="font-size:42px; line-height:1; margin-bottom:14px; opacity:0.5;">📋</div>
+      <h3 style="margin:0 0 6px; color:var(--text); text-transform:none; letter-spacing:0; font-size:15px;">
+        No screens uploaded yet
+      </h3>
+      <p class="muted" style="margin:0 0 18px; font-size:13px;">
+        Upload a UIXML + JS pair to start generating automation plans.
+      </p>
+      <a class="btn" href="{{ url_for('index') }}">Upload your first screen →</a>
+    </div>
   {% else %}
     <table>
       <thead>
         <tr>
           <th>Screen name</th>
           <th>Function ID</th>
+          <th>Status</th>
           <th>Blocks</th>
           <th>Fields</th>
           <th>Source files</th>
@@ -25,6 +41,13 @@
         <tr>
           <td><a href="{{ url_for('screen_detail', screen_id=s.id) }}">{{ s.name }}</a></td>
           <td class="mono">{{ s.function_id }}</td>
+          <td>
+            {% if s.verified_at %}
+              <span class="pill ok" title="Verified at {{ s.verified_at }}">✓ verified</span>
+            {% else %}
+              <span class="pill muted">unverified</span>
+            {% endif %}
+          </td>
           <td>{{ s.block_count }}</td>
           <td>{{ s.field_count }}</td>
           <td class="mono muted">

@@ -13,12 +13,13 @@ Flow:
 
 Run:
   python app.py
-  → http://127.0.0.1:5000
+  → http://127.0.0.1:5050   (override with FLASK_PORT=xxxx)
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -32,13 +33,14 @@ from claude_md_generator import (
     WORKFLOW_MODES, generate_claude_md, parse_decisions_from_form,
     parse_grid_decisions_from_form,
 )
-from db import (
+from mongo_db import (
     clear_excel_upload, create_run, delete_screen, get_all_settings,
-    get_claude_md, get_eligible_verify_run, get_field_decisions,
-    get_grid_decisions, get_meta_yaml, get_recipe, get_run, get_screen,
-    init_db, list_runs, list_screens, mark_verified, save_excel_upload,
-    save_field_decisions, save_grid_decisions, save_screen, set_settings,
-    unmark_verified, update_run,
+    get_button_decisions, get_claude_md, get_eligible_verify_run,
+    get_field_decisions, get_grid_decisions, get_meta_yaml, get_recipe,
+    get_run, get_screen, init_db, list_runs, list_screens, mark_verified,
+    save_button_decisions, save_excel_upload, save_field_decisions,
+    save_grid_decisions, save_screen, set_settings, unmark_verified,
+    update_run,
 )
 from excel_handler import (
     read_uploaded as read_uploaded_excel,
@@ -75,6 +77,18 @@ def index():
 
 @app.post("/upload")
 def upload():
+    # Gate: Settings page must be filled before any screen can be uploaded.
+    # The home page enforces this client-side via a modal, but check here
+    # too so the API can't be bypassed by direct POSTs.
+    cfg_ok, cfg_missing = runner.runtime_config_status()
+    if not cfg_ok:
+        flash(
+            "Configure FLEXCUBE credentials in Settings before uploading "
+            "screens. Missing: " + ", ".join(cfg_missing),
+            "error",
+        )
+        return redirect(url_for("settings_view"))
+
     screen_name = (request.form.get("screen_name") or "").strip()
     uixml_file = request.files.get("uixml")
     js_file = request.files.get("js")
@@ -322,11 +336,13 @@ def screen_review(screen_id: int):
         abort(404)
     prior = get_field_decisions(DB_PATH, screen_id)
     prior_grids = get_grid_decisions(DB_PATH, screen_id)
+    prior_buttons = get_button_decisions(DB_PATH, screen_id)
     return render_template(
         "review.html",
         screen=screen,
         prior_decisions=prior,
         prior_grid_decisions=prior_grids,
+        prior_button_decisions=prior_buttons,
         workflow_modes=WORKFLOW_MODES,
         active_mode=screen.get("workflow_mode") or "create_new",
     )
@@ -356,6 +372,15 @@ def screen_generate(screen_id: int):
             screen["blocks"], screen["fields"], request.form,
         )
 
+    # Custom in-screen button decisions: form keys are `button_<NAME>=1` for
+    # the buttons the user opted to click. Only consider buttons declared
+    # as `is_custom=True` — standard toolbar buttons are always part of
+    # the plan and not user-toggleable.
+    button_decisions: dict[str, bool] = {
+        b["name"]: bool(request.form.get(f"button_{b['name']}"))
+        for b in (screen.get("buttons") or []) if b.get("is_custom")
+    }
+
     excel_rows = None
     excel_grid_rows: dict[str, list[dict]] = {}
     if workflow_mode == "bulk_load":
@@ -381,6 +406,7 @@ def screen_generate(screen_id: int):
             excel_rows=excel_rows,
             grid_rows=grid_rows,
             excel_grid_rows=excel_grid_rows,
+            button_decisions=button_decisions,
         )
     except Exception as exc:
         flash(f"Failed to generate plan: {exc}", "error")
@@ -388,6 +414,7 @@ def screen_generate(screen_id: int):
 
     save_field_decisions(DB_PATH, screen_id, decisions, workflow_mode, claude_md)
     save_grid_decisions(DB_PATH, screen_id, grid_rows)
+    save_button_decisions(DB_PATH, screen_id, button_decisions)
 
     used = sum(1 for d in decisions if d["mode"] != "skip")
     flash(f"Generated CLAUDE.md from {used} field decisions.", "success")
@@ -598,4 +625,7 @@ def screen_delete(screen_id: int):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+    # Port 5000 is taken on this machine by another project (GoldJewelryAPI).
+    # Override with FLASK_PORT in the environment if you need a different one.
+    port = int(os.environ.get("FLASK_PORT", "5050"))
+    app.run(debug=True, host="127.0.0.1", port=port)

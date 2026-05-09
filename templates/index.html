@@ -9,7 +9,21 @@
     you can hand directly to Claude.
   </p>
 
-  <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+  {% if not cfg_ok %}
+    {# Inline banner — visible reminder before the user even clicks. The
+       modal handles the click-time intercept; this just makes the gate
+       discoverable on first paint. #}
+    <div class="flash error" style="margin: 12px 0 18px;">
+      <strong style="margin-right:6px">Settings required.</strong>
+      <span class="muted">
+        Configure FLEXCUBE credentials before uploading.
+      </span>
+      <a href="{{ url_for('settings_view') }}" style="margin-left:auto">Open Settings →</a>
+    </div>
+  {% endif %}
+
+  <form action="{{ url_for('upload') }}" method="post"
+        enctype="multipart/form-data" data-requires-config>
     <label>
       <span>Screen name</span>
       <input type="text" name="screen_name" placeholder="e.g. Fund Online" required autofocus>
@@ -26,7 +40,7 @@
       </label>
     </div>
 
-    <button type="submit">Parse &amp; generate meta.yaml</button>
+    <button type="submit">Parse screen →</button>
     <a href="{{ url_for('screens_list') }}" class="btn ghost" style="margin-left:8px">View history</a>
   </form>
 </div>
@@ -59,7 +73,7 @@
           {% if s.verified_at %}
             <span class="pill ok">✓ verified</span>
           {% else %}
-            <span class="pill">unverified</span>
+            <span class="pill muted">unverified</span>
           {% endif %}
         </td>
         <td class="mono muted">{{ s.created_at }}</td>

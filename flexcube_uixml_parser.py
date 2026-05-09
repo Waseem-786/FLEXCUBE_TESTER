@@ -101,6 +101,20 @@ class ButtonModel:
     name: str
     label: str | None = None
     parent_block: str | None = None
+    # `is_custom` distinguishes custom screen-author-declared buttons (e.g.
+    # "Submit", "Calculation") from the FLEXCUBE-standard toolbar buttons
+    # (New / Save / Authorize / etc.) that `_inject_standard_buttons` adds.
+    # Custom buttons are surfaced in the review form as opt-in click prompts;
+    # standard ones are part of every plan and aren't user-toggleable.
+    is_custom: bool = False
+    # Position of this button relative to the FIELDs in the same block, in
+    # UIXML declaration order. 0 = before any field, N = after the Nth field
+    # (so a button at the end of a block whose block has 3 fields gets
+    # position_in_block=3). The generator/compiler use this to interleave
+    # button-click steps in their natural place during the form fill, rather
+    # than dumping them all at the end. None for top-level buttons that have
+    # no parent block.
+    position_in_block: int | None = None
 
 
 @dataclass
@@ -408,8 +422,25 @@ class FlexcubeUIXMLParser:
             if tag in FIELD_TAGS:
                 # Make sure this field's nearest ancestor block is THIS block,
                 # not some nested one. We do this with a quick walk-up.
-                if self._nearest_block_is(child, elem):
-                    block.fields.append(self._parse_field(child, block))
+                if not self._nearest_block_is(child, elem):
+                    continue
+                # FLEXCUBE encodes custom in-screen buttons (Submit / Calculation
+                # etc.) as `<FIELD><TYPE>BUTTON</TYPE>...</FIELD>`. Redirect
+                # these to the buttons collection instead of letting them
+                # appear as data fields in the form. The button's position is
+                # the count of fields ALREADY added to the block, so the
+                # generator can interleave it in the right spot during render.
+                inner_type = (_attr_or_child(child, "Type") or "").upper()
+                if inner_type == "BUTTON":
+                    model.buttons.append(ButtonModel(
+                        name=_attr_or_child(child, "Name", "Id") or "UNNAMED_BUTTON",
+                        label=_attr_or_child(child, "Label", "Caption", "Lbl"),
+                        parent_block=block.name,
+                        is_custom=True,
+                        position_in_block=len(block.fields),
+                    ))
+                    continue
+                block.fields.append(self._parse_field(child, block))
             elif tag in BUTTON_TAGS:
                 model.buttons.append(ButtonModel(
                     name=_attr(child, "Name", "Id") or "UNNAMED_BUTTON",

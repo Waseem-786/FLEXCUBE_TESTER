@@ -4,112 +4,540 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}FLEXCUBE Screen Tester{% endblock %}</title>
+  {# Inline SVG favicon so the browser doesn't 404 on /favicon.ico every
+     page load. Tiny "FX" mark in the accent colour. #}
+  <link rel="icon" href='data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="%235b8def"/><text x="16" y="22" font-family="ui-sans-serif,system-ui" font-size="16" font-weight="700" text-anchor="middle" fill="white">FX</text></svg>'>
   <style>
+    /* ============================================================
+       Design tokens — Linear/Vercel-style modern dev-tool aesthetic.
+       Deeper darks + a saturated accent + soft elevation. Motion is
+       calibrated short (140-220ms) so the UI feels snappy, not flashy.
+       ============================================================ */
     :root {
-      --bg: #0f1115;
-      --panel: #161a22;
-      --panel-2: #1d2230;
-      --border: #2a3142;
-      --text: #e6e8ee;
-      --muted: #8c93a3;
-      --accent: #5b8def;
-      --accent-soft: rgba(91, 141, 239, 0.15);
-      --success: #4ade80;
-      --danger: #f87171;
-      --mono: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; }
-    body {
-      background: var(--bg);
-      color: var(--text);
-      font: 14.5px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 24px 80px; }
-    header.top {
-      display: flex; align-items: baseline; justify-content: space-between;
-      padding-bottom: 18px; margin-bottom: 28px; border-bottom: 1px solid var(--border);
-    }
-    header.top h1 { font-size: 18px; margin: 0; letter-spacing: 0.2px; }
-    header.top h1 a { color: var(--text); text-decoration: none; }
-    header.top nav a {
-      color: var(--muted); text-decoration: none; margin-left: 18px; font-size: 13px;
-    }
-    header.top nav a:hover { color: var(--text); }
-    h2 { font-size: 16px; margin: 32px 0 14px; letter-spacing: 0.2px; }
-    h3 { font-size: 13.5px; margin: 22px 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.6px; }
-    a { color: var(--accent); }
-    .panel {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-      padding: 22px 22px;
-    }
-    .panel + .panel { margin-top: 18px; }
-    .muted { color: var(--muted); }
-    .mono { font-family: var(--mono); font-size: 12.8px; }
-    .pill {
-      display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px;
-      background: var(--accent-soft); color: var(--accent); margin-right: 6px;
-    }
-    .pill.warn { background: rgba(248, 113, 113, 0.15); color: var(--danger); }
-    .pill.ok   { background: rgba(74, 222, 128, 0.15); color: var(--success); }
+      /* Surfaces */
+      --bg:           #0a0d14;
+      --bg-soft:      #0d1119;
+      --panel:        #131720;
+      --panel-2:      #1a2030;
+      --panel-hover:  #1c2334;
+      --border:       #232a3d;
+      --border-strong:#2f3850;
 
+      /* Text */
+      --text:         #e8ebf2;
+      --text-soft:    #c8cdd9;
+      --muted:        #9aa0b0;
+      --muted-soft:   #6e7384;
+
+      /* Accent + semantic */
+      --accent:       #6b8eff;
+      --accent-strong:#8aa4ff;
+      --accent-soft:  rgba(107, 142, 255, 0.14);
+      --accent-glow:  rgba(107, 142, 255, 0.35);
+      --accent-grad:  linear-gradient(135deg, #6b8eff 0%, #8a6bff 100%);
+
+      --success:      #4ade80;
+      --success-soft: rgba(74, 222, 128, 0.13);
+      --warning:      #fbbf24;
+      --warning-soft: rgba(251, 191, 36, 0.13);
+      --danger:       #f87171;
+      --danger-soft:  rgba(248, 113, 113, 0.13);
+
+      /* Type */
+      --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", "Inter", Roboto, sans-serif;
+
+      /* Radii */
+      --r-sm: 6px;
+      --r-md: 10px;
+      --r-lg: 14px;
+      --r-xl: 18px;
+
+      /* Elevation */
+      --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+      --shadow-md: 0 4px 12px rgba(0,0,0,0.32), 0 1px 2px rgba(0,0,0,0.5);
+      --shadow-lg: 0 12px 32px rgba(0,0,0,0.45), 0 2px 4px rgba(0,0,0,0.5);
+      --shadow-glow: 0 0 0 3px var(--accent-glow);
+
+      /* Motion */
+      --ease:     cubic-bezier(0.4, 0.0, 0.2, 1);
+      --ease-out: cubic-bezier(0.0, 0.0, 0.2, 1);
+      --t-fast:   140ms;
+      --t-base:   200ms;
+      --t-slow:   320ms;
+    }
+
+    /* ============================================================
+       Reset + base
+       ============================================================ */
+    *, *::before, *::after { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      min-height: 100vh;
+      background:
+        radial-gradient(ellipse at top, rgba(107,142,255,0.08), transparent 60%),
+        radial-gradient(ellipse at bottom right, rgba(138,107,255,0.06), transparent 50%),
+        var(--bg);
+      color: var(--text);
+      font: 14.5px/1.55 var(--sans);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      text-rendering: optimizeLegibility;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+      }
+    }
+
+    /* Page-load fade-in. Subtle: 220ms, slight rise. */
+    @keyframes page-in {
+      from { opacity: 0; transform: translateY(4px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes shimmer {
+      0%   { background-position: -200% 0; }
+      100% { background-position: 200% 0; }
+    }
+    @keyframes flash-in {
+      from { opacity: 0; transform: translateY(-6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.55; }
+    }
+
+    .wrap {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 28px 24px 120px;
+      animation: page-in var(--t-slow) var(--ease-out) both;
+    }
+
+    /* ============================================================
+       Header / nav
+       ============================================================ */
+    header.top {
+      display: flex; align-items: center; justify-content: space-between;
+      padding-bottom: 18px; margin-bottom: 32px;
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 10;
+      background:
+        linear-gradient(to bottom, var(--bg) 70%, transparent);
+      padding-top: 4px;
+    }
+    header.top h1 {
+      font-size: 16.5px; margin: 0; letter-spacing: -0.2px; font-weight: 700;
+      display: flex; align-items: center; gap: 10px;
+    }
+    header.top h1 a {
+      color: var(--text); text-decoration: none;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .brand-mark {
+      width: 26px; height: 26px; border-radius: 7px;
+      background: var(--accent-grad);
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 800; color: #fff; letter-spacing: 0;
+      box-shadow: 0 4px 14px var(--accent-glow), inset 0 1px 0 rgba(255,255,255,0.2);
+    }
+    header.top nav { display: flex; gap: 4px; }
+    header.top nav a {
+      color: var(--muted); text-decoration: none;
+      padding: 7px 13px; border-radius: var(--r-md); font-size: 13px; font-weight: 500;
+      transition: color var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease);
+    }
+    header.top nav a:hover { color: var(--text); background: var(--panel); }
+    header.top nav a.active {
+      color: var(--text); background: var(--panel);
+      box-shadow: inset 0 0 0 1px var(--border);
+    }
+
+    /* ============================================================
+       Typography
+       ============================================================ */
+    h2 {
+      font-size: 17px; margin: 32px 0 14px; letter-spacing: -0.2px; font-weight: 600;
+    }
+    h3 {
+      font-size: 11.5px; margin: 22px 0 10px;
+      color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600;
+    }
+    a { color: var(--accent); transition: color var(--t-fast) var(--ease); }
+    a:hover { color: var(--accent-strong); }
+    p { margin: 0 0 12px; }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); font-size: 12.6px; }
+
+    /* ============================================================
+       Panel — the workhorse container
+       ============================================================ */
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      padding: 22px 22px;
+      box-shadow: var(--shadow-sm);
+      transition:
+        background-color var(--t-base) var(--ease),
+        border-color var(--t-base) var(--ease),
+        transform var(--t-base) var(--ease),
+        box-shadow var(--t-base) var(--ease);
+    }
+    .panel + .panel { margin-top: 16px; }
+    /* Panel that's clickable as a whole — gets a subtle lift on hover. */
+    .panel.interactive { cursor: pointer; }
+    .panel.interactive:hover {
+      background: var(--panel-hover);
+      border-color: var(--border-strong);
+      transform: translateY(-1px);
+      box-shadow: var(--shadow-md);
+    }
+
+    /* ============================================================
+       Pills / badges
+       ============================================================ */
+    .pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      padding: 2px 9px; border-radius: 999px;
+      font-size: 11.5px; font-weight: 500;
+      background: var(--accent-soft); color: var(--accent-strong);
+      margin-right: 4px;
+      border: 1px solid transparent;
+      transition: background-color var(--t-fast) var(--ease);
+    }
+    .pill.warn { background: var(--warning-soft); color: var(--warning); }
+    .pill.ok   { background: var(--success-soft); color: var(--success); }
+    .pill.muted { background: var(--panel-2); color: var(--muted); }
+
+    /* ============================================================
+       Inputs / form controls
+       ============================================================ */
     label { display: block; margin-bottom: 14px; }
-    label > span { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12.5px; }
-    input[type="text"], input[type="file"] {
-      width: 100%; padding: 10px 12px; background: var(--panel-2);
-      color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    label > span {
+      display: block; margin-bottom: 6px; color: var(--muted);
+      font-size: 12.5px; font-weight: 500;
+    }
+    input[type="text"], input[type="password"], input[type="email"],
+    input[type="number"], input[type="date"], input[type="file"],
+    input[type="url"], input[type="search"], textarea, select {
+      width: 100%;
+      padding: 10px 13px;
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
       font: inherit;
+      transition:
+        border-color var(--t-fast) var(--ease),
+        background-color var(--t-fast) var(--ease),
+        box-shadow var(--t-fast) var(--ease);
     }
-    input[type="text"]:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+    input::placeholder, textarea::placeholder { color: var(--muted-soft); }
+    input:hover:not(:focus):not([readonly]):not([disabled]),
+    select:hover:not(:focus):not([disabled]),
+    textarea:hover:not(:focus):not([readonly]) {
+      border-color: var(--border-strong);
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: var(--shadow-glow);
+      background: var(--panel-2);
+    }
+    /* Native file input chrome */
+    input[type="file"]::file-selector-button {
+      background: var(--panel-hover);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 6px 12px;
+      margin-right: 12px;
+      font: inherit; font-weight: 500;
+      cursor: pointer;
+      transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease);
+    }
+    input[type="file"]::file-selector-button:hover {
+      background: var(--accent-soft); border-color: var(--accent);
+    }
+    /* Date picker calendar icon — make it visible against the dark theme */
+    input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.8); cursor: pointer; }
+
+    /* Radio group cards (used on review.html for workflow modes) */
+    .workflow-modes {
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+    }
+    @media (max-width: 760px) { .workflow-modes { grid-template-columns: repeat(2, 1fr); } }
+    .mode-radio {
+      display: flex; align-items: center; gap: 10px; cursor: pointer;
+      padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-md);
+      background: var(--panel-2);
+      font-size: 13px; font-weight: 500; margin: 0;
+      transition: all var(--t-fast) var(--ease);
+    }
+    .mode-radio:hover { border-color: var(--border-strong); background: var(--panel-hover); }
+    .mode-radio.disabled {
+      opacity: 0.4; cursor: not-allowed;
+    }
+    .mode-radio:has(input:checked) {
+      border-color: var(--accent); background: var(--accent-soft);
+      box-shadow: var(--shadow-glow);
+    }
+    .mode-radio input[type="radio"] {
+      width: 14px; height: 14px; margin: 0;
+      accent-color: var(--accent);
+    }
+
+    /* ============================================================
+       Buttons
+       ============================================================ */
     button, .btn {
-      display: inline-block; padding: 9px 16px; background: var(--accent); color: white;
-      border: 0; border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      padding: 9px 16px;
+      background: var(--accent-grad);
+      color: white;
+      border: 0;
+      border-radius: var(--r-md);
+      font: inherit; font-weight: 600; font-size: 13.5px;
+      letter-spacing: -0.1px;
+      cursor: pointer;
       text-decoration: none;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.1) inset, var(--shadow-sm);
+      transition:
+        transform var(--t-fast) var(--ease),
+        box-shadow var(--t-fast) var(--ease),
+        background-color var(--t-fast) var(--ease),
+        filter var(--t-fast) var(--ease),
+        color var(--t-fast) var(--ease);
     }
+    button:hover, .btn:hover {
+      filter: brightness(1.08);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset, 0 6px 18px var(--accent-glow);
+      transform: translateY(-1px);
+    }
+    button:active, .btn:active {
+      transform: translateY(0);
+      filter: brightness(0.96);
+    }
+    button:focus-visible, .btn:focus-visible {
+      outline: none; box-shadow: var(--shadow-glow);
+    }
+
     button.ghost, .btn.ghost {
-      background: transparent; color: var(--text); border: 1px solid var(--border);
+      background: transparent; color: var(--text);
+      border: 1px solid var(--border);
+      box-shadow: none;
+    }
+    button.ghost:hover, .btn.ghost:hover {
+      background: var(--panel-hover); border-color: var(--border-strong);
+      filter: none; box-shadow: var(--shadow-sm);
     }
     button.danger, .btn.danger {
-      background: transparent; color: var(--danger); border: 1px solid var(--border);
+      background: transparent; color: var(--danger);
+      border: 1px solid rgba(248,113,113,0.3);
+      box-shadow: none;
     }
-    button:hover { filter: brightness(1.08); }
+    button.danger:hover, .btn.danger:hover {
+      background: var(--danger-soft); border-color: var(--danger);
+      filter: none;
+    }
+    button:disabled, .btn:disabled {
+      opacity: 0.5; cursor: not-allowed; transform: none !important;
+      box-shadow: var(--shadow-sm); filter: none;
+    }
 
+    /* ============================================================
+       Tables
+       ============================================================ */
     table { width: 100%; border-collapse: collapse; margin-top: 6px; }
-    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
-    th { color: var(--muted); font-weight: 500; font-size: 12.5px; text-transform: uppercase; letter-spacing: 0.4px; }
-    tr:hover td { background: rgba(255, 255, 255, 0.02); }
+    th, td {
+      text-align: left; padding: 11px 12px;
+      border-bottom: 1px solid var(--border); vertical-align: middle;
+    }
+    th {
+      color: var(--muted); font-weight: 600; font-size: 11.5px;
+      text-transform: uppercase; letter-spacing: 0.6px;
+    }
+    tbody tr {
+      transition: background-color var(--t-fast) var(--ease);
+    }
+    tbody tr:hover td { background: rgba(255,255,255,0.025); }
+    tbody tr:last-child td { border-bottom: none; }
 
+    /* ============================================================
+       Flash / toast
+       ============================================================ */
     .flash {
-      padding: 10px 14px; border-radius: 8px; margin-bottom: 18px; font-size: 13.5px;
+      padding: 12px 16px; border-radius: var(--r-md);
+      margin-bottom: 14px; font-size: 13.5px;
       border: 1px solid var(--border);
+      background: var(--panel);
+      animation: flash-in var(--t-base) var(--ease-out) both;
+      display: flex; align-items: center; gap: 10px;
     }
-    .flash.error   { background: rgba(248, 113, 113, 0.10); color: var(--danger); border-color: rgba(248,113,113,0.4); }
-    .flash.success { background: rgba(74, 222, 128, 0.10); color: var(--success); border-color: rgba(74,222,128,0.4); }
+    .flash::before {
+      content: ""; width: 8px; height: 8px; border-radius: 50%; flex: none;
+      background: var(--accent);
+    }
+    .flash.error   { border-color: rgba(248,113,113,0.4); }
+    .flash.error::before { background: var(--danger); }
+    .flash.error   { color: var(--danger); }
+    .flash.success { border-color: rgba(74,222,128,0.4); }
+    .flash.success::before { background: var(--success); }
+    .flash.success { color: var(--success); }
 
+    /* ============================================================
+       Code blocks
+       ============================================================ */
     pre.code {
-      background: #0a0c11; border: 1px solid var(--border); border-radius: 8px;
-      padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px;
-      color: #cfd3dd; max-height: 420px;
+      background: #070a10; border: 1px solid var(--border); border-radius: var(--r-md);
+      padding: 16px 18px; overflow: auto;
+      font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
+      color: #d3d7e2; max-height: 480px;
+      box-shadow: var(--shadow-sm);
     }
+    pre.code::-webkit-scrollbar { width: 10px; height: 10px; }
+    pre.code::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; }
+    pre.code::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
 
+    /* ============================================================
+       Layout helpers
+       ============================================================ */
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
 
     .meta-row { display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap; }
-    .meta-row .k { color: var(--muted); font-size: 12.5px; }
+    .meta-row .k { color: var(--muted); font-size: 12px; font-weight: 500; }
     .meta-row .v { font-family: var(--mono); }
 
     .row-actions form { display: inline; }
+
+    /* Skip-link / focus polish */
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+    /* Custom scrollbar (tasteful, optional) */
+    ::-webkit-scrollbar { width: 12px; height: 12px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; border: 3px solid transparent; background-clip: content-box; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); border: 3px solid transparent; background-clip: content-box; }
+
+    /* Mobile nav */
+    @media (max-width: 600px) {
+      header.top { flex-wrap: wrap; gap: 8px; }
+      header.top nav { flex-wrap: wrap; }
+      header.top nav a { padding: 6px 10px; }
+      .wrap { padding: 16px 14px 100px; }
+      .panel { padding: 16px; }
+    }
+
+    /* ============================================================
+       Modal — used by the config-gate dialog (and reusable elsewhere)
+       ============================================================ */
+    .modal-backdrop {
+      position: fixed; inset: 0;
+      background: rgba(5, 7, 12, 0.72);
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      z-index: 100;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity var(--t-base) var(--ease);
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px;
+    }
+    .modal-backdrop[data-open="true"] {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--r-lg);
+      padding: 28px 28px 22px;
+      max-width: 480px; width: 100%;
+      box-shadow: var(--shadow-lg);
+      transform: translateY(8px) scale(0.98);
+      transition: transform var(--t-base) var(--ease);
+    }
+    .modal-backdrop[data-open="true"] .modal {
+      transform: translateY(0) scale(1);
+    }
+    .modal-icon {
+      width: 44px; height: 44px;
+      border-radius: 12px;
+      background: var(--warning-soft);
+      color: var(--warning);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 22px; font-weight: 700;
+      margin-bottom: 16px;
+    }
+    .modal-title {
+      font-size: 17px; font-weight: 600;
+      margin: 0 0 6px; letter-spacing: -0.2px;
+    }
+    .modal-body {
+      color: var(--muted); font-size: 13.5px; line-height: 1.55;
+      margin: 0 0 18px;
+    }
+    .modal-body strong { color: var(--text); font-weight: 600; }
+    .modal-missing-list {
+      background: var(--bg-soft); border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 10px 14px;
+      margin: 12px 0;
+      font-family: var(--mono); font-size: 12.5px;
+      color: var(--text-soft);
+    }
+    .modal-missing-list code {
+      display: inline-block; background: transparent;
+      color: var(--warning); margin-right: 8px;
+    }
+    .modal-actions {
+      display: flex; gap: 8px; justify-content: flex-end;
+      margin-top: 18px;
+    }
+    .modal-close {
+      position: absolute; top: 12px; right: 12px;
+      width: 32px; height: 32px;
+      border-radius: var(--r-sm);
+      background: transparent; color: var(--muted);
+      border: 0; cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; line-height: 1;
+      transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
+    }
+    .modal-close:hover {
+      background: var(--panel-hover); color: var(--text);
+      transform: none; box-shadow: none; filter: none;
+    }
+    .modal { position: relative; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <header class="top">
-      <h1><a href="{{ url_for('index') }}">FLEXCUBE Screen Tester</a></h1>
+      <h1>
+        <a href="{{ url_for('index') }}">
+          <span class="brand-mark" aria-hidden="true">FX</span>
+          FLEXCUBE Screen Tester
+        </a>
+      </h1>
       <nav>
-        <a href="{{ url_for('index') }}">Upload</a>
-        <a href="{{ url_for('screens_list') }}">History</a>
+        {# active-link helper: matches current request endpoint to mark the
+           appropriate nav item. Falls back to no highlight on routes that
+           don't map cleanly to a top-level nav (e.g. /screens/<id>). #}
+        {% set ep = request.endpoint or '' %}
+        <a href="{{ url_for('index') }}"
+           class="{{ 'active' if ep in ('index', 'upload') }}">Upload</a>
+        <a href="{{ url_for('screens_list') }}"
+           class="{{ 'active' if ep == 'screens_list' }}">History</a>
         <a href="{{ url_for('settings_view') }}"
+           class="{{ 'active' if ep in ('settings_view', 'settings_save') }}"
            {% if cfg_ok is defined and not cfg_ok %}
              style="color: var(--danger);"
              title="Missing: {{ (cfg_missing or []) | join(', ') }}"
@@ -127,5 +555,90 @@
 
     {% block content %}{% endblock %}
   </div>
+
+  {# ============================================================
+     Settings-required modal. Hidden by default, shown by the JS
+     below when a `data-requires-config` form is submitted while
+     FLEXCUBE settings are missing. Reusable for any future flow
+     that needs a "you must do X first" gate.
+     ============================================================ #}
+  <div id="modal-config-required" class="modal-backdrop"
+       role="dialog" aria-modal="true"
+       aria-labelledby="modal-config-title"
+       aria-describedby="modal-config-body">
+    <div class="modal">
+      <button type="button" class="modal-close" aria-label="Close" data-modal-dismiss>×</button>
+      <div class="modal-icon" aria-hidden="true">⚠</div>
+      <h3 id="modal-config-title" class="modal-title">Settings required</h3>
+      <p id="modal-config-body" class="modal-body">
+        Configure your FLEXCUBE credentials before uploading screens.
+        The runner needs these values to log in and execute generated plans.
+      </p>
+      <div id="modal-missing-list" class="modal-missing-list" hidden></div>
+      <div class="modal-actions">
+        <button type="button" class="ghost" data-modal-dismiss>Not now</button>
+        <a class="btn" href="{{ url_for('settings_view') }}">Open Settings →</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      // Server-injected runtime-config status. Used by the gate below.
+      const CFG_OK      = {{ 'true' if cfg_ok else 'false' }};
+      const CFG_MISSING = {{ (cfg_missing or []) | tojson }};
+
+      const modal = document.getElementById('modal-config-required');
+      const missingEl = document.getElementById('modal-missing-list');
+
+      function populateMissing() {
+        if (!CFG_MISSING || CFG_MISSING.length === 0) {
+          missingEl.hidden = true;
+          return;
+        }
+        missingEl.hidden = false;
+        missingEl.innerHTML =
+          'Missing: ' +
+          CFG_MISSING.map(k => '<code>' + k + '</code>').join(' ');
+      }
+
+      function openModal() {
+        populateMissing();
+        modal.setAttribute('data-open', 'true');
+        // Focus first dismiss control for keyboard users.
+        const dismiss = modal.querySelector('[data-modal-dismiss]');
+        if (dismiss) setTimeout(() => dismiss.focus(), 50);
+      }
+      function closeModal() {
+        modal.removeAttribute('data-open');
+      }
+
+      // Close on backdrop click (ignore clicks on the dialog itself).
+      modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+      });
+      // Close on any element with [data-modal-dismiss].
+      modal.querySelectorAll('[data-modal-dismiss]').forEach(el => {
+        el.addEventListener('click', closeModal);
+      });
+      // Escape closes the modal.
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && modal.getAttribute('data-open') === 'true') {
+          closeModal();
+        }
+      });
+
+      // Intercept any form marked `data-requires-config` when settings
+      // are missing, and surface the modal instead of submitting.
+      document.querySelectorAll('form[data-requires-config]').forEach(form => {
+        form.addEventListener('submit', (e) => {
+          if (!CFG_OK) {
+            e.preventDefault();
+            openModal();
+          }
+        });
+      });
+    })();
+  </script>
 </body>
 </html>

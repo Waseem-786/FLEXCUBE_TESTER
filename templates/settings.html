@@ -6,9 +6,10 @@
   <h2 style="margin:0 0 6px">Project settings</h2>
   <p class="muted" style="margin:0; font-size:13px">
     These values flow into both runners (Claude Code &amp; deterministic) when
-    you click Run plan. They're saved into <span class="mono">screens.db</span>
-    (gitignored). The legacy <span class="mono">.env</span> file at the project
-    root still works as a fallback for any value left blank below.
+    you click Run plan. They're saved into the
+    <span class="mono">kv</span> collection in MongoDB. A
+    <span class="mono">.env</span> file at the project root still works as a
+    fallback for any value left blank below.
   </p>
 </div>
 
@@ -74,9 +75,10 @@
       {% endif %}
     </div>
     <p class="muted" style="margin:10px 0 0; font-size:12.5px">
-      Passwords are stored unencrypted in <span class="mono">screens.db</span>
-      (gitignored). Same security profile as a <span class="mono">.env</span>
-      file. Don't commit the DB.
+      Passwords are stored unencrypted in the MongoDB
+      <span class="mono">kv</span> collection. Treat the cluster as
+      sensitive — same security profile as a <span class="mono">.env</span>
+      file.
     </p>
   </div>
 </form>

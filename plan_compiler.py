@@ -55,14 +55,19 @@ def compile_plan(
     excel_rows: list[dict] | None = None,
     grid_rows: dict[str, list[dict]] | None = None,
     excel_grid_rows: dict[str, list[dict]] | None = None,
+    button_decisions: dict[str, bool] | None = None,
     recipe: dict | None = None,
 ) -> list[dict[str, Any]]:
     """`grid_rows` (Create New): {block_name: [{field_name: value}, ...]}.
     `excel_grid_rows` (Bulk Load): same shape but read from per-grid
-    Excel sheets — bulk composer filters per master via MASTER_KEY."""
+    Excel sheets — bulk composer filters per master via MASTER_KEY.
+    `button_decisions`: {button_name: True} for custom in-screen buttons
+    the user opted to click; emitted as `click_screen_button` steps after
+    field fills, before Save."""
     if workflow_mode == "bulk_load":
         steps = _compile_bulk_load(screen, decisions, excel_rows or [],
-                                    excel_grid_rows or {})
+                                    excel_grid_rows or {},
+                                    button_decisions or {})
         return _apply_recipe_recordings(steps, recipe, screen)
     if workflow_mode != "create_new":
         raise ValueError(
@@ -133,16 +138,29 @@ def compile_plan(
                   "args": {"name": f"step_{n.idx:02d}_new_entry.png"}})
 
     # ----- 5..N. Fill blocks, then grids ----------------------------------
+    # Bucket buttons by parent block so each block's renderer interleaves
+    # the ones declared inside it. Buttons without a parent_block fall
+    # through to the orphan-fallback emit further below.
+    buttons_by_block: dict[str, list[dict]] = {}
+    for b in (screen.get("buttons") or []):
+        if b.get("is_custom") and b.get("parent_block"):
+            buttons_by_block.setdefault(b["parent_block"], []).append(b)
+
     grid_blocks: list[dict] = []
     for block in blocks:
         block_fields = [f for f in fields if f["block_name"] == block["name"]]
-        if not block_fields:
+        block_buttons = buttons_by_block.get(block["name"], [])
+        if not block_fields and not block_buttons:
             continue
         if block.get("is_grid"):
             grid_blocks.append(block)
             continue
 
-        block_steps = _block_steps(block, block_fields, decisions_by_key, lov_index_map)
+        block_steps = _block_steps(
+            block, block_fields, decisions_by_key, lov_index_map,
+            block_buttons=block_buttons,
+            button_decisions=button_decisions or {},
+        )
         if not block_steps:
             continue
         title = n.title(f"Fill {block.get('label') or block['name']}")
@@ -152,6 +170,7 @@ def compile_plan(
         steps.append({"kind": "screenshot", "title": title,
                       "args": {"name": f"step_{n.idx:02d}_fill_{block['name'].lower()}.png"}})
 
+    grid_idx_map = _editable_grid_index_map(blocks, fields)
     for grid in grid_blocks:
         gfields = [f for f in fields if f["block_name"] == grid["name"]]
         if all(f.get("readonly") for f in gfields):
@@ -160,11 +179,33 @@ def compile_plan(
         if not rows:
             continue  # grid is optional and the user didn't add any rows
         title = n.title(f"Add Rows to {grid.get('label') or grid['name']}")
-        for s in _compile_grid_steps(grid, gfields, rows):
+        for s in _compile_grid_steps(grid, gfields, rows,
+                                      grid_index=grid_idx_map.get(grid["name"])):
             s["title"] = title
             steps.append(s)
         steps.append({"kind": "screenshot", "title": title,
                       "args": {"name": f"step_{n.idx:02d}_grid_{grid['name'].lower()}.png"}})
+
+    # ----- Orphan custom buttons (no parent_block) ----------------------
+    # In-block custom buttons are already interleaved at their UIXML
+    # position by `_block_steps`. Buttons that have no parent block are
+    # rare in real screens but get a click step here as a fallback so
+    # they're never silently dropped.
+    orphan_pressed = [
+        b for b in _custom_buttons_to_press(screen.get("buttons") or [], button_decisions or {})
+        if not b.get("parent_block")
+    ]
+    if orphan_pressed:
+        title = n.title("Click in-screen actions")
+        for btn in orphan_pressed:
+            steps.append({
+                "kind":  "click_screen_button",
+                "title": title,
+                "args":  {"label": btn.get("label") or btn.get("name"),
+                          "name":  btn.get("name")},
+            })
+        steps.append({"kind": "screenshot", "title": title,
+                      "args": {"name": f"step_{n.idx:02d}_custom_actions.png"}})
 
     # ----- N+1. Save ------------------------------------------------------
     steps.append({
@@ -206,11 +247,51 @@ def _block_steps(
     block_fields: list[dict],
     decisions_by_key: dict,
     lov_index_map: dict[tuple[str | None, str], int],
+    block_buttons: list[dict] | None = None,
+    button_decisions: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
+    """Field-fill steps for a single block, with custom-button click steps
+    interleaved at their UIXML position. Mirror of
+    `claude_md_generator._render_block_actions` so plan + markdown stay
+    in sync."""
+    block_buttons = block_buttons or []
+    button_decisions = button_decisions or {}
+
+    pressed_at: dict[int, list[dict]] = {}
+    for b in block_buttons:
+        if not b.get("is_custom") or not button_decisions.get(b.get("name")):
+            continue
+        pos = b.get("position_in_block")
+        if pos is None:
+            pos = len(block_fields)
+        pressed_at.setdefault(int(pos), []).append(b)
+
+    def _btn_steps(slot: int) -> list[dict[str, Any]]:
+        steps: list[dict[str, Any]] = []
+        for b in pressed_at.get(slot, []):
+            steps.append({
+                "kind":  "click_screen_button",
+                "title": "",
+                "args":  {"label": b.get("label") or b.get("name"),
+                          "name":  b.get("name")},
+            })
+        return steps
+
     out: list[dict[str, Any]] = []
-    for f in block_fields:
+    out.extend(_btn_steps(0))
+    for i, f in enumerate(block_fields):
         decision = decisions_by_key.get((block["name"], f["name"]))
         out.extend(_field_steps(block, f, decision, lov_index_map))
+        out.extend(_btn_steps(i + 1))
+    # Buttons positioned beyond the last field also emit at end-of-block.
+    for slot in sorted(s for s in pressed_at if s > len(block_fields)):
+        for b in pressed_at[slot]:
+            out.append({
+                "kind":  "click_screen_button",
+                "title": "",
+                "args":  {"label": b.get("label") or b.get("name"),
+                          "name":  b.get("name")},
+            })
     return out
 
 
@@ -220,6 +301,10 @@ def _field_steps(
     decision: dict | None,
     lov_index_map: dict,
 ) -> list[dict[str, Any]]:
+    # Read-only fields are auto-populated by FLEXCUBE — never emit a step
+    # for them, even if a stale decision somehow exists in the DB.
+    if field.get("readonly"):
+        return []
     if decision is None or decision["mode"] == "skip":
         return []
 
@@ -274,9 +359,12 @@ def _compile_bulk_load(
     decisions: list[dict],
     excel_rows: list[dict],
     excel_grid_rows: dict[str, list[dict]] | None = None,
+    button_decisions: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     excel_grid_rows = excel_grid_rows or {}
-    """Bulk-load: login + navigate once, then per-row [New, fill, Save]."""
+    button_decisions = button_decisions or {}
+    """Bulk-load: login + navigate once, then per-row [New, fill, Save].
+    Button decisions are global — same custom buttons clicked for every row."""
     fid = screen["function_id"]
     blocks = screen["blocks"]
     fields = screen["fields"]
@@ -312,6 +400,16 @@ def _compile_bulk_load(
                       "args": {"reason": "no Excel rows to process"}})
         return steps
 
+    # Bucket buttons by parent block once — used per row in the loop below.
+    buttons_by_block: dict[str, list[dict]] = {}
+    for b in (screen.get("buttons") or []):
+        if b.get("is_custom") and b.get("parent_block"):
+            buttons_by_block.setdefault(b["parent_block"], []).append(b)
+
+    # Position of each editable grid in DOM order (for unambiguous + button
+    # targeting on multi-grid screens).
+    bulk_grid_idx_map = _editable_grid_index_map(blocks, fields)
+
     for i, excel_row in enumerate(rows, start=1):
         title = f"Process row {i} of {len(rows)}"
         ident = _row_identifier(fields, excel_row)
@@ -320,13 +418,20 @@ def _compile_bulk_load(
 
         row_decisions = _materialise_for_row(decisions, excel_row, fields)
         decisions_by_key = {(d.get("block_name"), d["field_name"]): d for d in row_decisions}
+        # Per-row button decisions: Excel cell `Press_<NAME>` overrides the
+        # review-form global toggle.
+        from claude_md_generator import _resolve_button_decisions_for_row
+        row_btn_decisions = _resolve_button_decisions_for_row(
+            screen.get("buttons") or [], excel_row, button_decisions,
+        )
 
         steps.append({"kind": "click_screen_action", "title": n.title(title),
                       "args": {"action": "NEW"}})
 
         for block in blocks:
             block_fields = [f for f in fields if f["block_name"] == block["name"]]
-            if not block_fields:
+            block_buttons = buttons_by_block.get(block["name"], [])
+            if not block_fields and not block_buttons:
                 continue
             if block.get("is_grid"):
                 if all(f.get("readonly") for f in block_fields):
@@ -342,14 +447,29 @@ def _compile_bulk_load(
                 )
                 if not grid_rows_for_master:
                     continue
-                for s in _compile_grid_steps(block, block_fields, grid_rows_for_master):
+                for s in _compile_grid_steps(block, block_fields, grid_rows_for_master,
+                                              grid_index=bulk_grid_idx_map.get(block["name"])):
                     s["title"] = title
                     steps.append(s)
                 continue
 
-            for f in block_fields:
-                d = decisions_by_key.get((block["name"], f["name"]))
-                steps.extend(_field_step_objs(block, f, d, lov_index_map, title))
+            # Interleave field-fills + in-block button clicks at UIXML position.
+            for s in _block_steps(block, block_fields, decisions_by_key, lov_index_map,
+                                   block_buttons=block_buttons,
+                                   button_decisions=row_btn_decisions):
+                s["title"] = title
+                steps.append(s)
+
+        # Orphan custom buttons (no parent_block) emit before Save as fallback.
+        for btn in _custom_buttons_to_press(screen.get("buttons") or [], row_btn_decisions):
+            if btn.get("parent_block"):
+                continue
+            steps.append({
+                "kind":  "click_screen_button",
+                "title": title,
+                "args":  {"label": btn.get("label") or btn.get("name"),
+                          "name":  btn.get("name")},
+            })
 
         steps.append({"kind": "click_screen_action", "title": n.same_title(),
                       "args": {"action": "SAVE"}})
@@ -364,16 +484,41 @@ def _compile_bulk_load(
 _CHECKBOX_TRUTHY = {"YES", "Y", "TRUE", "1", "TICK", "TICKED", "CHECKED"}
 
 
+def _editable_grid_index_map(blocks: list[dict], fields: list[dict]) -> dict[str, int]:
+    """Map each editable grid block's name → its 0-based position among
+    editable grids in DOM order (= UIXML declaration order). A grid is
+    "editable" when it has at least one non-readonly field — read-only-only
+    grids like FST_HIST don't render an add-row button so we skip them.
+
+    The deterministic runner uses this index with `.nth(grid_index)` on
+    the page's `+` buttons so a `grid_add_row` step targeting FST_ASSET_1
+    always clicks the asset grid's add-row button, never another grid's."""
+    out: dict[str, int] = {}
+    idx = 0
+    for b in blocks:
+        if not b.get("is_grid"):
+            continue
+        gfields = [f for f in fields if f["block_name"] == b["name"]]
+        if not gfields or all(f.get("readonly") for f in gfields):
+            continue
+        out[b["name"]] = idx
+        idx += 1
+    return out
+
+
 def _compile_grid_steps(
     grid: dict,
     grid_fields: list[dict],
     rows: list[dict],
+    grid_index: int | None = None,
 ) -> list[dict[str, Any]]:
     """Compile multi-row Add Row + per-cell fill steps for an editable
     grid block. `rows` is a list of {field_name: value} dicts (one per
     grid row the user entered). Read-only columns are dropped. Empty
     rows are dropped so trailing-blank editor rows don't manufacture
-    phantom Add-Row clicks.
+    phantom Add-Row clicks. `grid_index` (0-based among editable grids)
+    is stamped on each grid_add_row step so the runner picks the right
+    grid's `+` button on multi-grid screens.
 
     Cell type mapping mirrors the markdown generator's `_cell_to_decision`:
       LOV-bound  → grid_select_lov
@@ -387,12 +532,16 @@ def _compile_grid_steps(
     editable = [f for f in grid_fields if not f.get("readonly")]
     truthy = {"YES", "Y", "TRUE", "1", "TICK", "TICKED", "CHECKED"}
 
+    add_row_args = {"grid_block_name": grid["name"]}
+    if grid_index is not None:
+        add_row_args["grid_index"] = int(grid_index)
+
     for row in rows:
         if not any((row.get(f["name"]) not in (None, ""))
                    for f in editable):
             continue
         out.append({"kind": "grid_add_row", "title": "",
-                    "args": {"grid_block_name": grid["name"]}})
+                    "args": dict(add_row_args)})
         for f in editable:
             cell = row.get(f["name"])
             if cell in (None, ""):
@@ -470,13 +619,19 @@ def _row_identifier(fields: list[dict], row: dict) -> dict | None:
     return None
 
 
-def _field_step_objs(block, field, decision, lov_index_map, title) -> list[dict]:
-    """Same as _field_steps but pre-titles the steps so they're attributable
-    to the correct row in the live log."""
-    base = _field_steps(block, field, decision, lov_index_map)
-    for s in base:
-        s["title"] = title
-    return base
+def _custom_buttons_to_press(
+    buttons: list[dict], decisions: dict[str, bool],
+) -> list[dict]:
+    """Filter screen.buttons down to the custom (non-default) ones the
+    user opted to click. Mirror of `claude_md_generator._custom_buttons_to_press`
+    so plan + markdown stay in sync."""
+    out = []
+    for b in buttons:
+        if not b.get("is_custom"):
+            continue
+        if decisions.get(b.get("name")):
+            out.append(b)
+    return out
 
 
 # ---------------------------------------------------------------------------

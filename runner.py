@@ -42,7 +42,10 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from db import create_run, set_run_kind, update_run, get_recipe, get_grid_decisions
+from mongo_db import (
+    create_run, set_run_kind, update_run, get_recipe, get_grid_decisions,
+    get_button_decisions,
+)
 from plan_compiler import compile_plan
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -108,23 +111,23 @@ def load_dotenv(path: Path = DOTENV_PATH) -> dict[str, str]:
 def runtime_config(db_path: Path | None = None) -> dict[str, str | None]:
     """Resolve every FLEXCUBE_ runtime setting in priority order:
 
-      1. The Settings page (kv rows in screens.db).  ← canonical source
-      2. The `.env` file at the project root.        ← legacy fallback
-      3. os.environ.                                  ← last resort
+      1. The Settings page (kv collection in MongoDB).  ← canonical source
+      2. The `.env` file at the project root.            ← legacy fallback
+      3. os.environ.                                      ← last resort
 
-    Most callers want path #1, but the function accepts an optional
-    `db_path` so it can also be invoked from contexts that don't have
-    Flask's `DB_PATH` in scope. When `db_path` is None, falls back to
-    the project-root default.
+    The `db_path` argument is kept for back-compat with the SQLite era;
+    Mongo doesn't use it (the connection string comes from MONGODB_URI).
+    Connection errors fall through silently — `.env` and os.environ act
+    as fallbacks so a misconfigured Mongo doesn't lock the user out of
+    the run page entirely (they can still work by filling .env).
     """
+    _ = db_path  # kept for back-compat
     db_settings: dict[str, str] = {}
-    target_db = db_path or (PROJECT_ROOT / "screens.db")
-    if target_db.exists():
-        try:
-            from db import get_all_settings
-            db_settings = get_all_settings(target_db) or {}
-        except Exception:
-            db_settings = {}
+    try:
+        from mongo_db import get_all_settings
+        db_settings = get_all_settings() or {}
+    except Exception:
+        db_settings = {}
 
     file_env = load_dotenv()
     out: dict[str, str | None] = {}
@@ -218,6 +221,20 @@ Hard rules — these are non-negotiable:
    session), re-enter the same password and click OK / Continue / Yes.
    Don't abandon the run on this — it's expected when the same user has
    another active session. After the dialog clears, proceed normally.
+
+3b. **Grid cells in FCJNeoWeb are lazily mounted.** When typing into an
+   editable grid cell, do NOT target the underlying `#BLK_<block>__<field>I`
+   input by ID — that input only exists in the DOM while the cell has
+   focus, and a `.fill()` against it can complete "successfully" while
+   the value silently fails to commit when focus moves away. Instead:
+     1. Click the cell first via `getByRole('gridcell', {{ name: '<label>' }})`
+        — or `getByRole('cell', …)` / the visible label text near the
+        target row as fallbacks. The click mounts the input and focuses it.
+     2. Type the value with `browser_type` on the now-focused input.
+     3. Press **Tab** to fire the on-blur handler so FCJNeoWeb commits the
+        value. Without Tab the value can revert.
+   Apply this whenever a fill into a grid row's input appears to succeed
+   but the visible cell shows blank or the wrong value afterwards.
 
 4. If any action fails (timeout, element not found, FLEXCUBE validation
    error, unexpected popup not described in the plan), STOP, take a
@@ -408,6 +425,7 @@ def start_run_deterministic(
     excel_rows = None
     excel_grid_rows: dict[str, list[dict]] = {}
     grid_rows = get_grid_decisions(db_path, screen_id) or {}
+    button_decisions = get_button_decisions(db_path, screen_id) or {}
 
     if workflow_mode == "bulk_load":
         excel_path = screen.get("excel_path")
@@ -440,6 +458,7 @@ def start_run_deterministic(
             excel_rows=excel_rows,
             grid_rows=grid_rows,
             excel_grid_rows=excel_grid_rows,
+            button_decisions=button_decisions,
             recipe=recipe,
         )
     except Exception as exc:
@@ -520,7 +539,7 @@ def _reap(db_path: Path, run_id: int, proc: subprocess.Popen, log_fp) -> None:
 
     # Status reflects who terminated it. If a Stop button kicked in, the DB
     # row is already 'stopped' — don't overwrite that with 'completed'.
-    from db import get_run as _get  # local import to avoid cycles in some setups
+    from mongo_db import get_run as _get  # local import to avoid cycles in some setups
     current = _get(db_path, run_id)
     if current and current.get("status") == "stopped":
         update_run(db_path, run_id, finished_at=_now_iso(), exit_code=rc)

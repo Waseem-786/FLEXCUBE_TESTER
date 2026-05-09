@@ -103,8 +103,34 @@ def write_template(
     master_ws = wb.active
     master_ws.title = MASTER_SHEET_NAME if editable_grids else SHEET_NAME
 
-    if master_decisions:
-        _populate_sheet(master_ws, master_decisions, field_lookup, placeholder_rows)
+    # Custom in-screen buttons (Submit / Calculation / etc.) get per-row
+    # Yes/No columns appended to the master sheet so each row decides
+    # independently whether the runner should click them. Standard FLEXCUBE
+    # toolbar buttons (`is_custom=False`) aren't user-toggleable.
+    custom_buttons = [b for b in (screen.get("buttons") or []) if b.get("is_custom")]
+    button_decisions_for_sheet = [
+        {"block_name": "_buttons", "field_name": _button_column_name(b),
+         "mode": "excel", "value": _button_column_name(b)}
+        for b in custom_buttons
+    ]
+    button_field_lookup = {
+        ("_buttons", _button_column_name(b)): {
+            "block_name": "_buttons",
+            "name":  _button_column_name(b),
+            "label": (b.get("label") or b.get("name")),
+            "datatype": "BUTTON_PRESS",
+        }
+        for b in custom_buttons
+    }
+    combined_field_lookup = {**field_lookup, **button_field_lookup}
+
+    if master_decisions or button_decisions_for_sheet:
+        _populate_sheet(
+            master_ws,
+            master_decisions + button_decisions_for_sheet,
+            combined_field_lookup,
+            placeholder_rows,
+        )
     else:
         master_ws["A1"] = "(No master-block fields are 'from Excel'.)"
 
@@ -174,6 +200,13 @@ def _populate_sheet(
         ws.merge_cells(f"A{3 + placeholder_rows}:{last_col}{3 + placeholder_rows}")
         note = ws.cell(row=3 + placeholder_rows, column=1, value=intro)
         note.font = Font(italic=True, color="888888", size=10)
+
+
+def _button_column_name(btn: dict) -> str:
+    """Excel column header for a custom in-screen button. Prefix `Press_`
+    is load-bearing — `read_uploaded_full` keys on it to extract per-row
+    button decisions from each parsed row."""
+    return f"Press_{btn.get('name')}"
 
 
 def _safe_sheet_name(name: str) -> str:
@@ -252,6 +285,8 @@ def _format_hint(field: dict, datatype: str) -> str:
     if name == "MASTER_KEY":
         return ("BLANK = apply to every master record. "
                 "Or fill 1/2/3/… to link this row to one specific master.")
+    if datatype == "BUTTON_PRESS":
+        return f"({label}) — Yes to click this button for this row, No / blank to skip"
     if datatype == "DATE":
         return f"({label}) — date YYYY-MM-DD"
     if datatype == "CHECKBOX":
@@ -292,6 +327,23 @@ def _apply_column_format(
     if field.get("name") == "MASTER_KEY":
         for r in range(3, 3 + DATA_ROW_RANGE):
             ws.cell(row=r, column=col_idx).number_format = "0"
+        return
+
+    # Custom-button press toggle: Yes/No dropdown, identical mechanics to
+    # the CHECKBOX validator. Read-back uses the same Yes/Y/True/1 truthy
+    # set so the bulk composer can map the cell to a click decision.
+    if datatype == "BUTTON_PRESS":
+        dv = DataValidation(
+            type="list",
+            formula1='"Yes,No"',
+            allow_blank=True,
+            showErrorMessage=True,
+            errorStyle="warning",
+            error="Use Yes or No (or leave blank to skip).",
+        )
+        dv.showDropDown = False
+        dv.add(rng_str)
+        ws.add_data_validation(dv)
         return
 
     # LOV-bound fields are free text. Don't add validation; let the user

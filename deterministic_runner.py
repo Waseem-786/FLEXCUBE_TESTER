@@ -474,7 +474,11 @@ def _try_lov_prefilter(popup, label: str, row_match: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _do_grid_add_row(ctx: _Ctx, args: dict) -> str:
-    fc.grid_add_row_button(ctx.screen()).click(timeout=10_000)
+    # Multi-grid screens have a + button per grid. Use the compiler-stamped
+    # `grid_index` to pick the right one; fall back to .last via None when
+    # the args don't include it (single-grid screens, older recipes).
+    grid_index = args.get("grid_index")
+    fc.grid_add_row_button(ctx.screen(), grid_index=grid_index).click(timeout=10_000)
     # Brief settle so the new row's inputs are mounted before we target them.
     ctx.page.wait_for_timeout(400)
     grid = args.get("grid_block_name", "")
@@ -483,13 +487,22 @@ def _do_grid_add_row(ctx: _Ctx, args: dict) -> str:
 
 def _do_grid_fill_field(ctx: _Ctx, args: dict) -> str:
     label = args["label"]; value = args["value"]
-    fc.grid_field_in_last_row(ctx.screen(), label).fill(value)
+    # FCJNeoWeb grids mount the editable <input> only when the cell has
+    # focus. `grid_cell_focus` clicks the cell at (column header X × last
+    # row Y) to force the input to mount, then returns the now-mounted
+    # input Locator. We .fill() it (Playwright handles focus + commit),
+    # then Tab so onValidate fires and the value sticks.
+    input_loc = fc.grid_cell_focus(ctx.screen(), ctx.page, label)
+    input_loc.fill(value)
+    ctx.page.keyboard.press("Tab")
     return f"grid filled {label} = {value}"
 
 
 def _do_grid_enter_date(ctx: _Ctx, args: dict) -> str:
     label = args["label"]; value = args["value"]
-    fc.grid_field_in_last_row(ctx.screen(), label).fill(value)
+    input_loc = fc.grid_cell_focus(ctx.screen(), ctx.page, label)
+    input_loc.fill(value)
+    ctx.page.keyboard.press("Tab")
     return f"grid date {label} = {value}"
 
 
@@ -510,6 +523,25 @@ def _do_grid_tick_checkbox(ctx: _Ctx, args: dict) -> str:
     # can override per checkbox if a deployment needs input-click instead.
     ctx.screen().get_by_text(label, exact=True).last.click()
     return f"grid ticked {label}"
+
+
+def _do_click_screen_button(ctx: _Ctx, args: dict) -> str:
+    """Click a custom in-screen action button (Submit / Calculation / etc.)
+    by label. Standard toolbar actions (NEW/SAVE/etc.) go through
+    `click_screen_action`; this one is reserved for the user-toggleable
+    custom buttons declared on the screen."""
+    label = args["label"]
+    fc.screen_button(ctx.screen(), label).click(timeout=15_000)
+    # FLEXCUBE often shows an information popup after a custom action
+    # (e.g. "Calculation completed"). Try to dismiss it; ignore failure
+    # if no popup appears.
+    try:
+        popup = fc.info_popup_frame(ctx.screen())
+        role, name = fc.INFO_POPUP_OK_ROLE
+        popup.get_by_role(role, name=name).click(timeout=2000)
+        return f"clicked {label}; dismissed info popup"
+    except Exception:
+        return f"clicked {label}"
 
 
 def _do_grid_select_lov(ctx: _Ctx, args: dict) -> str:
@@ -752,6 +784,10 @@ _DISPATCH = {
     "grid_select_dropdown": _do_grid_select_dropdown,
     "grid_tick_checkbox":   _do_grid_tick_checkbox,
     "grid_select_lov":      _do_grid_select_lov,
+    # Custom in-screen action buttons (Submit / Calculation / etc.) — emitted
+    # by plan_compiler when the user opted into them on the review form or
+    # marked Yes in the corresponding `Press_<NAME>` Excel column.
+    "click_screen_button":  _do_click_screen_button,
     "screenshot":           _do_screenshot,
     "todo":                 _do_todo,
     # Replay-from-recording: walks a captured Playwright sequence with

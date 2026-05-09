@@ -6,13 +6,20 @@ files into a ready-to-run **CLAUDE.md** automation plan, then optionally
 Claude Code (the LLM agent) or a deterministic Python Playwright runner.
 
 > **Status**: end-to-end working for **Create New** and **Bulk Load from Excel**
-> on both UIXML dialects we've seen (attribute-based and the real FLEXCUBE
-> child-element export). Both runners are live (LLM agent + selectors-from-a-
-> verified-run). Multi-row grid blocks supported in both runners and in the
-> bulk-load Excel template (one sheet per grid). Verified Claude Code runs
-> capture both selector overrides AND a full Playwright action recording the
-> deterministic runner can replay step-by-step. Copy / Modify workflows and
-> the maker-checker authorize half of execution are roadmap.
+> on both UIXML dialects (attribute-based and the real FLEXCUBE child-element
+> export). Both runners are live (LLM agent + selectors-from-a-verified-run).
+> **Multi-row grids** in both runners + bulk-load Excel template (one sheet
+> per grid; multi-grid disambiguation via grid-index targeting). **Custom
+> in-screen action buttons** (`<TYPE>BUTTON</TYPE>` like Submit / Calculation)
+> render as opt-in click prompts, interleaved at their UIXML position in the
+> generated plan. **Read-only fields are eliminated** from form, Excel, and
+> plan — auto-populated by FLEXCUBE. **Settings** are persisted to a shared
+> **MongoDB** cluster and gate uploads with a properly-styled modal until
+> credentials are configured. **Modern Linear/Vercel-style design system**
+> with refined dark theme, gradient primary buttons, soft elevation, smooth
+> focus rings, and motion calibrated to feel responsive without being flashy.
+> Copy / Modify workflows and the maker-checker authorize half of execution
+> are roadmap.
 
 ---
 
@@ -31,13 +38,19 @@ clean change report.
 
 ## Quick start
 
+Python 3.10+ and a MongoDB cluster (Atlas free tier works fine).
+
 ```powershell
 python -m pip install -r requirements.txt
+copy .env.example .env
+# Edit .env: set MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/
 python app.py
-# open http://127.0.0.1:5000
+# open http://127.0.0.1:5050
 ```
 
-Python 3.10+. SQLite is created automatically at `screens.db` on first run.
+The app stores **everything** (parsed screens, generated plans, runs, saved
+settings) in MongoDB. The first connection ensures indexes lazily; no
+schema/migration step required.
 
 For plan **execution** you also need:
 
@@ -53,13 +66,28 @@ npm install -g @anthropic-ai/claude-code
 python -m playwright install chromium
 ```
 
-Configure runtime credentials via the **Settings** page in the app
-(gear icon, top-right) — values persist into the local `screens.db`
-and survive restarts. A `.env` file with the same `FLEXCUBE_*` keys is
-still picked up as a fallback if Settings is empty.
+Open the app, click **Settings** (top-right) and enter the FLEXCUBE
+**Base URL / User ID / Password** — these persist into the MongoDB `kv`
+collection. The home page won't let you upload a screen until these are
+filled (a styled modal pops up with a direct link to Settings if you try).
+A `.env` file with the same `FLEXCUBE_*` keys is still honoured as a
+fallback if Settings hasn't been populated.
 
 The Playwright MCP server is already declared in [.mcp.json](.mcp.json) at
 the project root, so no `claude mcp add` step is needed.
+
+### Migrating from the SQLite era
+
+If you have an existing `screens.db` from a previous version, copy its
+data into Mongo with one command:
+
+```powershell
+python migrate_sqlite_to_mongo.py
+# verify in Compass / the app, then once happy:
+Remove-Item screens.db
+```
+
+The script is idempotent (upserts by `function_id`); safe to re-run.
 
 ---
 
@@ -85,7 +113,8 @@ On the review page, choose:
 
 **Create New** — type values into the per-field widgets (text input, date
 picker, checkbox state, dropdown of parsed options, "row matching X" for
-LOVs). Required fields can't be skipped; readonly fields are dimmed.
+LOVs). Required fields can't be skipped; **read-only fields are dropped
+entirely** (FLEXCUBE auto-populates them).
 
 **Bulk Load** — click *Download template*, fill in your data offline,
 *Upload* the filled file. The page shows ✓ uploaded · N rows once it lands.
@@ -93,16 +122,25 @@ The template is **multi-sheet** when the screen has editable grid blocks:
 a `Master` sheet for the master block plus one sheet per grid. Grid sheets
 lead with a `MASTER_KEY` column — leave it blank to broadcast the row to
 every master, or fill `1` / `2` / `3` to attach a grid row to a specific
-master record (1-based row index of the Master sheet).
+master record (1-based row index of the Master sheet). The master sheet
+also gets a `Press_<NAME>` Yes/No column for each custom in-screen action
+button on the screen, so each row decides whether to click that button.
 
 **Grids in Create New** — editable grids render as a mini-table with
 `+ Add row` / `× remove` buttons. Read-only-only grids (e.g. a History
 panel auto-populated by FLEXCUBE) are omitted from the form, the plan,
 and the Excel template.
 
+**In-screen actions** — when a screen declares custom buttons in UIXML
+(e.g. SUBMIT, Calculation), the review page shows an **In-screen actions**
+panel with a styled checkbox card per button. The generated plan emits a
+"Click **&lt;Label&gt;**" step at the **button's natural UIXML position
+within its parent block** — so a Submit button declared at the end of
+Block A clicks at the end of Block A, not lumped before Save.
+
 ### 4. Generate
 
-Click *Generate CLAUDE.md*. The plan composes deterministically — no LLM in
+Click *Generate plan →*. The plan composes deterministically — no LLM in
 the generation path. You land on the screen detail page with the rendered
 plan + download button + meta.yaml.
 
@@ -167,9 +205,9 @@ chrome a tester doesn't manually fill on the main form:
 | `<FOOTER>` | `FLDSET ID="FLD_AUDIT*"` (Maker, Checker, AuthStatus, Mod No, …) | Maker-checker chrome |
 | `<HEADER>` | Empty structural wrapper | No real fields |
 
-The older attribute-based dialect (e.g. `samples/IADFNONL.UIXML`) declares
-blocks at the root with no SUMMARY/HEADER/FOOTER wrappers, so the filter is a
-no-op there — backward compatibility preserved.
+The attribute-based dialect declares blocks at the root with no
+SUMMARY/HEADER/FOOTER wrappers, so the filter is a no-op there — backward
+compatibility preserved.
 
 ---
 
@@ -212,10 +250,16 @@ comment so nothing silently goes missing.
 
 ## Persistence
 
-Everything is on disk in `screens.db` (SQLite). It survives Flask restarts,
-browser refreshes, OS reboots. Re-uploading a screen pre-fills your prior
-field decisions on the review page. The app's home page shows recent
+Everything lives in MongoDB — `screens` (with embedded blocks / fields /
+buttons / dependencies / validations / decisions), `runs`, `kv` (Settings),
+and a `counters` collection that mints sequential integer IDs so URLs like
+`/screens/4` and `/runs/19` keep working. The home page shows recent
 uploads with verified-state badges so persistence is visible immediately.
+
+`screens.db` (the legacy SQLite file) is no longer used by the app — if
+yours still exists from a previous version, run
+`python migrate_sqlite_to_mongo.py` to copy its data into Mongo, then
+delete the file.
 
 ---
 
@@ -224,7 +268,12 @@ uploads with verified-state badges so persistence is visible immediately.
 ```
 .
 ├── app.py                       Flask routes
-├── db.py                        SQLite schema + helpers, runtime migrations
+├── mongo_db.py                  MongoDB persistence (screens / runs / kv /
+│                                counters). Drop-in replacement for the
+│                                v1 SQLite layer; same public function
+│                                names and signatures.
+├── migrate_sqlite_to_mongo.py   One-shot copy of legacy screens.db → Mongo.
+│                                Idempotent; safe to re-run.
 ├── runner.py                    Subprocess manager: Claude Code (LLM) +
 │                                deterministic runner. Same SSE log page,
 │                                same Stop button.
@@ -257,11 +306,13 @@ uploads with verified-state badges so persistence is visible immediately.
 │                                persist into the kv table; canonical for
 │                                runtime_config())
 ├── samples/                     Real FLEXCUBE artifacts to test against
-│   ├── IADFNONL.UIXML/.js       Old attribute-based dialect (illustrative)
 │   ├── IADPRFNL.xml/.js         Real FLEXCUBE child-element dialect
-│   ├── IADPBALO.xml/.js         Real FLEXCUBE child-element dialect
+│   ├── IADPBALO.xml/.js         Real FLEXCUBE — has a SELECT dropdown field
 │   ├── IADSKINP.xml/.js         Real FLEXCUBE child-element dialect
 │   ├── IADASFNL.xml/.js         Real FLEXCUBE — has an editable grid block
+│   ├── IADADHPL.xml/.js         Real FLEXCUBE — has multi-grid (Asset + Liab),
+│   │                            custom in-screen buttons (Submit / Calculation),
+│   │                            and SELECT dropdowns with parsed options
 │   ├── CLAUDE.md                Team's hand-written reference plan
 │   └── SAMPLE_TEST_THROUGH_CLAUDE_CODE.txt
 │                                The Claude Code run log the deterministic

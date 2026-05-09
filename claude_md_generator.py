@@ -52,13 +52,18 @@ def generate_claude_md(
     excel_rows: list[dict] | None = None,
     grid_rows: dict[str, list[dict]] | None = None,
     excel_grid_rows: dict[str, list[dict]] | None = None,
+    button_decisions: dict[str, bool] | None = None,
 ) -> str:
     """`grid_rows` (Create New): {block_name: [{field_name: value, ...}, ...]}.
     `excel_grid_rows` (Bulk Load): same shape but read from per-grid Excel
-    sheets; bulk composer groups by master key."""
+    sheets; bulk composer groups by master key.
+    `button_decisions`: {button_name: True} for custom in-screen buttons the
+    user opted to click (e.g. Submit, Calculation). Ignored for buttons
+    that aren't `is_custom`."""
     if workflow_mode == "bulk_load":
         return _generate_bulk_load(screen, decisions, excel_rows or [],
-                                    excel_grid_rows or {})
+                                    excel_grid_rows or {},
+                                    button_decisions or {})
     if workflow_mode != "create_new":
         raise ValueError(
             f"workflow_mode={workflow_mode!r} is not implemented; "
@@ -133,9 +138,18 @@ def generate_claude_md(
     grid_blocks: list[dict] = []
     used_at_least_one_decision = False
 
+    # Pre-bucket buttons by their parent block so each block's renderer
+    # can interleave the ones declared inside it. Buttons with no
+    # parent block are handled at the end of this section.
+    buttons_by_block: dict[str, list[dict]] = {}
+    for b in (screen.get("buttons") or []):
+        if b.get("is_custom") and b.get("parent_block"):
+            buttons_by_block.setdefault(b["parent_block"], []).append(b)
+
     for block in blocks:
         block_fields = [f for f in fields if f["block_name"] == block["name"]]
-        if not block_fields:
+        block_buttons = buttons_by_block.get(block["name"], [])
+        if not block_fields and not block_buttons:
             continue
         if block["is_grid"]:
             # Render grids in a separate later step so the form-block flow
@@ -143,7 +157,11 @@ def generate_claude_md(
             grid_blocks.append(block)
             continue
 
-        block_lines = _render_block_actions(block, block_fields, decisions_by_key)
+        block_lines = _render_block_actions(
+            block, block_fields, decisions_by_key,
+            block_buttons=block_buttons,
+            button_decisions=button_decisions or {},
+        )
         if not block_lines:
             continue
         out.append(step.heading(f"Fill {block['label'] or block['name']}"))
@@ -168,6 +186,21 @@ def generate_claude_md(
 
     if not used_at_least_one_decision:
         out.append("<!-- TODO: no field decisions were provided — fill in the Review page. -->")
+        out.append("")
+
+    # --- Orphan custom buttons (no parent_block) -----------------------
+    # Buttons declared inside a block are already interleaved at their
+    # UIXML position by `_render_block_actions`. The fallback here only
+    # picks up buttons that have no parent_block (top-level / floating
+    # action buttons), so they don't get silently dropped.
+    orphan_pressed = [
+        b for b in _custom_buttons_to_press(screen.get("buttons") or [], button_decisions or {})
+        if not b.get("parent_block")
+    ]
+    if orphan_pressed:
+        out.append(step.heading("Click in-screen actions"))
+        for btn in orphan_pressed:
+            out.append(f"- Click **{btn.get('label') or btn.get('name')}** button")
         out.append("")
 
     # --- Save / Validate / Authorize --------------------------------
@@ -212,6 +245,41 @@ def generate_claude_md(
 
     out.append("---")
     out.append("")
+
+    # ---------------------------------------------- Troubleshooting (grids)
+    # Emit only if the screen has an editable grid — the workaround below
+    # is specific to FCJNeoWeb's lazy-mounted grid inputs.
+    has_editable_grid = any(
+        b.get("is_grid") and not _all_readonly(
+            [f for f in fields if f["block_name"] == b["name"]]
+        )
+        for b in blocks
+    )
+    if has_editable_grid:
+        out.extend([
+            "## Troubleshooting",
+            "",
+            "**If a grid cell fill appears to succeed but the value doesn't commit"
+            " (cell shows blank or the wrong value after Tab):** FCJNeoWeb mounts"
+            " grid `<input>` elements *only when the cell has focus*, and unmounts"
+            " them on blur. A `.fill()` against the underlying"
+            " `#BLK_<block>__<field>I` input can briefly succeed and then silently"
+            " be discarded. Workaround:",
+            "",
+            "1. Click the cell first — target it via"
+            " `getByRole('gridcell', { name: '<label>' })` (or `getByRole('cell', …)`"
+            " / visible label text near the row as fallbacks). This mounts the"
+            " input and gives it focus.",
+            "2. Type the value into the now-focused input.",
+            "3. Press **Tab** to fire the on-blur handler so FCJNeoWeb commits"
+            " the value. Without Tab the value can revert.",
+            "",
+            "Apply this only when the symptom appears — for cells that fill on the"
+            " first try, no extra steps are needed.",
+            "",
+            "---",
+            "",
+        ])
 
     # ---------------------------------------------- Technical Requirements
     out.extend([
@@ -288,14 +356,83 @@ def _render_block_actions(
     block: dict,
     block_fields: list[dict],
     decisions_by_key: dict,
+    block_buttons: list[dict] | None = None,
+    button_decisions: dict[str, bool] | None = None,
 ) -> list[str]:
-    """Form-block (single-entry) field actions, in declaration order."""
+    """Form-block (single-entry) field actions, in declaration order.
+    Custom buttons declared inside this block are interleaved at their
+    UIXML position (`position_in_block`) — so a SUBMIT button declared
+    after the last field gets clicked after the last fill, while a
+    Calculation button mid-block gets clicked between the appropriate
+    field fills."""
+    block_buttons = block_buttons or []
+    button_decisions = button_decisions or {}
+
+    # Index: at which "field-index slot" does each pressed button sit?
+    # 0 = before any field, N = after the N-th field.
+    pressed_at: dict[int, list[dict]] = {}
+    for b in block_buttons:
+        if not b.get("is_custom") or not button_decisions.get(b.get("name")):
+            continue
+        pos = b.get("position_in_block")
+        if pos is None:
+            pos = len(block_fields)  # treat as end-of-block by default
+        pressed_at.setdefault(int(pos), []).append(b)
+
     lines: list[str] = []
-    for f in block_fields:
+
+    def _flush_buttons_at(slot: int) -> None:
+        for b in pressed_at.get(slot, []):
+            lines.append(f"- Click **{b.get('label') or b.get('name')}** button.")
+
+    _flush_buttons_at(0)
+    for i, f in enumerate(block_fields):
         action = _field_action_lines(f, decisions_by_key.get((block["name"], f["name"])))
         if action:
             lines.extend(action)
+        _flush_buttons_at(i + 1)
+    # Any buttons positioned beyond the last field count as end-of-block.
+    for slot in sorted(s for s in pressed_at if s > len(block_fields)):
+        for b in pressed_at[slot]:
+            lines.append(f"- Click **{b.get('label') or b.get('name')}** button.")
     return lines
+
+
+def _custom_buttons_to_press(
+    buttons: list[dict], decisions: dict[str, bool],
+) -> list[dict]:
+    """Filter screen.buttons to the custom (non-default) ones the user
+    opted to click. Standard toolbar buttons (`is_custom=False`) are
+    always part of the surrounding flow, so we ignore them here."""
+    out = []
+    for b in buttons:
+        if not b.get("is_custom"):
+            continue
+        if decisions.get(b.get("name")):
+            out.append(b)
+    return out
+
+
+def _resolve_button_decisions_for_row(
+    buttons: list[dict], excel_row: dict, global_decisions: dict[str, bool],
+) -> dict[str, bool]:
+    """Combine per-row Excel cell overrides (`Press_<NAME>` columns) with
+    the global toggle from the review form. Excel cell wins when present;
+    blank cells fall back to the global decision so the user has a sensible
+    default for partially-filled rows.
+    Truthy cell values are matched case-insensitively against
+    `_CHECKBOX_TRUTHY` (Yes / Y / TRUE / 1 / etc.)."""
+    out: dict[str, bool] = {}
+    for b in buttons:
+        if not b.get("is_custom"):
+            continue
+        name = b.get("name")
+        cell = excel_row.get(f"Press_{name}")
+        if cell is not None and str(cell).strip():
+            out[name] = str(cell).strip().upper() in _CHECKBOX_TRUTHY
+        else:
+            out[name] = bool(global_decisions.get(name))
+    return out
 
 
 def _all_readonly(fields: list[dict]) -> bool:
@@ -357,6 +494,11 @@ def _field_action_lines(field: dict, decision: dict | None) -> list[str]:
     """Translate one (field, decision) pair into 1+ markdown bullet lines.
     Returns an empty list if the field should not appear in the workflow
     (skipped, or no decision given for an optional field)."""
+    # Read-only fields are auto-populated by FLEXCUBE — never appear in the
+    # workflow, never produce a TODO. They're filtered out of the review
+    # form entirely so we never even reach this branch with a decision.
+    if field.get("readonly"):
+        return []
     if decision is None or decision["mode"] == "skip":
         # Required fields with no decision get a TODO so the user notices.
         if field.get("required"):
@@ -431,8 +573,10 @@ def _generate_bulk_load(
     decisions: list[dict],
     excel_rows: list[dict],
     excel_grid_rows: dict[str, list[dict]] | None = None,
+    button_decisions: dict[str, bool] | None = None,
 ) -> str:
     excel_grid_rows = excel_grid_rows or {}
+    button_decisions = button_decisions or {}
     """Compose a CLAUDE.md that creates ONE record per row in the uploaded
     Excel file. Each row's body reuses the create_new rendering — login,
     Save, validation, and authorize steps appear ONCE at the top/bottom and
@@ -505,6 +649,12 @@ def _generate_bulk_load(
         "",
     ])
 
+    # Pre-bucket buttons by parent block (computed once across all rows).
+    buttons_by_block: dict[str, list[dict]] = {}
+    for b in (screen.get("buttons") or []):
+        if b.get("is_custom") and b.get("parent_block"):
+            buttons_by_block.setdefault(b["parent_block"], []).append(b)
+
     # Per-row body: repeat New → fill → Save for each row.
     for i, excel_row in enumerate(rows, start=1):
         title = f"Process row {i} of {len(rows)}"
@@ -519,10 +669,15 @@ def _generate_bulk_load(
 
         row_decisions = _materialise_for_row(decisions, excel_row, fields)
         decisions_by_key = {(d.get("block_name"), d["field_name"]): d for d in row_decisions}
+        # Per-row button decisions: Excel `Press_<NAME>` overrides global toggle.
+        row_btn_decisions = _resolve_button_decisions_for_row(
+            screen.get("buttons") or [], excel_row, button_decisions,
+        )
 
         for block in blocks:
             block_fields = [f for f in fields if f["block_name"] == block["name"]]
-            if not block_fields:
+            block_buttons = buttons_by_block.get(block["name"], [])
+            if not block_fields and not block_buttons:
                 continue
             if block["is_grid"]:
                 if _all_readonly(block_fields):
@@ -540,9 +695,19 @@ def _generate_bulk_load(
                         out.append("  " + line if line.startswith("- ") else line)
                 continue
 
-            for f in block_fields:
-                action_lines = _field_action_lines(f, decisions_by_key.get((block["name"], f["name"])))
-                out.extend(action_lines)
+            # Interleave block fields + in-block button clicks at their UIXML
+            # position so the plan reads "fill A, fill B, click Submit, fill C".
+            block_lines = _render_block_actions(
+                block, block_fields, decisions_by_key,
+                block_buttons=block_buttons,
+                button_decisions=row_btn_decisions,
+            )
+            out.extend(block_lines)
+
+        # Orphan custom buttons (no parent_block) emit before Save as a fallback.
+        for btn in _custom_buttons_to_press(screen.get("buttons") or [], row_btn_decisions):
+            if not btn.get("parent_block"):
+                out.append(f"- Click **{btn.get('label') or btn.get('name')}** button.")
 
         out.append("- Click **Save**.")
         out.append("- If any **Override** popup appears, click **Accept**.")
@@ -586,6 +751,40 @@ def _generate_bulk_load(
 
     out.append("---")
     out.append("")
+
+    # Conditional grid-cell troubleshooting — same rationale as create_new.
+    has_editable_grid = any(
+        b.get("is_grid") and not _all_readonly(
+            [f for f in fields if f["block_name"] == b["name"]]
+        )
+        for b in blocks
+    )
+    if has_editable_grid:
+        out.extend([
+            "## Troubleshooting",
+            "",
+            "**If a grid cell fill appears to succeed but the value doesn't commit"
+            " (cell shows blank or the wrong value after Tab):** FCJNeoWeb mounts"
+            " grid `<input>` elements *only when the cell has focus*, and unmounts"
+            " them on blur. A `.fill()` against the underlying"
+            " `#BLK_<block>__<field>I` input can briefly succeed and then silently"
+            " be discarded. Workaround:",
+            "",
+            "1. Click the cell first — target it via"
+            " `getByRole('gridcell', { name: '<label>' })` (or `getByRole('cell', …)`"
+            " / visible label text near the row as fallbacks). This mounts the"
+            " input and gives it focus.",
+            "2. Type the value into the now-focused input.",
+            "3. Press **Tab** to fire the on-blur handler so FCJNeoWeb commits"
+            " the value. Without Tab the value can revert.",
+            "",
+            "Apply this only when the symptom appears — for cells that fill on the"
+            " first try, no extra steps are needed.",
+            "",
+            "---",
+            "",
+        ])
+
     out.extend([
         "## Technical Requirements",
         "- Use Playwright or Selenium",
